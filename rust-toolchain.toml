@@ -1,0 +1,5 @@
+# Pin the toolchain so CI and local builds agree: a newer clippy/rustfmt adds lints and breaks CI overnight.
+# Bump deliberately (and fix new lints) rather than by surprise.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
