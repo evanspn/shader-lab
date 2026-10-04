@@ -6,3 +6,4 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float x = no_such_function(uv.x)
     fragColor = vec4(term.rgb + x, term.a);
 }
+// regress: skip (a deliberate fixture: does not compile)

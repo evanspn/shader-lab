@@ -109,6 +109,60 @@ The mouse works too: click or drag a number's bar, click a color's swatch to ope
 The terminal is restored (alternate screen, mouse, cursor, kitty image) on quit, Ctrl-C and panic. With no GPU it exits with a
 clear error. Build without the terminal UI or the window with `--no-default-features --features render`.
 
+## A living background: `shaderlab pane`
+
+```
+shaderlab pane FILE [--preset X] [--set k=v]... [--fps 30] [--scale auto|0.25..1.0] [--stats] [--pause-unfocused]
+                    [--protocol auto|kitty|sixel|halfblocks] [--text none|sample] [--time-wrap SECONDS] [--log FILE]
+```
+
+The shader fills the WHOLE terminal pane: no side panel, no footer, no border, the cursor hidden. Leave it running in a split next to
+your work:
+
+1. In Ghostty, split the window (`cmd+d` for a split to the right, `cmd+shift+d` below).
+2. In the new pane: `shaderlab pane ps3-visualizer.glsl --preset ps3-classic` (or any shader from `gpf` / `examples/shaders`).
+
+Keys (no input is needed): `q` / Esc / Ctrl-C quit, `p` or space pause, `n` / `N` next / previous preset, `s` save a PNG (to
+`$SHADERLAB_HOME/renders`), `?` a three-second help line. The pane follows resizes (the picture is re-rendered at the new size and
+replaces the old one in place, no flash) and works at any shape, wide, tall or tiny. The terminal is restored, the image deleted
+and the temp files removed on exit, Ctrl-C or panic; frame files left by a pane that was killed are cleaned at the next start.
+
+**Smoothness.** Frames are drawn straight to RGBA8 and read back through a ring of three staging buffers without ever waiting on
+the frame just submitted; a finished frame goes to a temp file the terminal reads (`t=t`, raw RGBA, one image id and one placement id
+replaced in place, inside one synchronized update). A fixed-step clock drops a frame it cannot keep up with and never answers it with a
+burst. **Adaptive quality** (`--scale auto`, the default) starts near 1080p and watches the 95th-percentile frame cost: over 85% of the
+frame budget it lowers the render scale (1.0, 0.75, 0.5, 0.35 of the start), then the frame rate (30, 24, 18, 15), and after 10 s of
+clear headroom it raises them again, frame rate first. `--stats` shows the size, scale, fps, p95 and dropped frames; `--log FILE`
+appends a line per second (seconds, fps, p95 ms, scale, fps target, dropped, bytes per frame, RSS KB). `--pause-unfocused` stops
+rendering while the pane or window is not focused (focus reporting, `CSI ? 1004 h`). `--time-wrap SECONDS` restarts `iTime`
+from 0 after that long, for shaders that are not written to run for days.
+
+## Regression checks: `shaderlab regress`
+
+```
+shaderlab regress [FILE|DIR...] [--only golden,orient,text,coverage,temporal,perf] [--fast] [--update]
+scripts/regress.sh [--fast|--update]       # regress + cargo test, exit non-zero on any failure
+scripts/install-hooks.sh                   # opt in: a pre-push hook that runs the fast subset
+```
+
+Every fix and every optimization is protected so a later change cannot quietly undo it. For each shader, each preset and each
+`scene` lock it checks: **golden** (the picture at a fixed time over the synthetic terminal frame against `tests/golden/<shader>/*.png`:
+mean and worst-16x16-block difference), **orient** (the same at 16:9, 4:3, 1:1, 9:16 and 3:1, so a flipped, stretched or rotated scene
+shows), **text** (text pixels unchanged), **coverage** and **flat** (how much of the frame it draws and its largest single-colour block,
+against the accepted values stored beside the golden), **temporal** (no frame pops, no lurch in average brightness, no step at the
+usual time-wrap moments) and **perf** (p50 / p95 ms per 1080p frame against `perf-baseline.json`, only on the machine it was recorded
+on; elsewhere it is skipped and says so). `--fast` is the quick subset: no perf, a short temporal run, no wrap probes.
+
+**Updating goldens deliberately.** When a look changes on purpose, run `shaderlab regress --update`: it rewrites the goldens, the
+accepted values and the baseline and prints what changed (`changed: mean 3.1, worst block 40.2`, `new`, or `unchanged`). Review the
+images in the diff, then commit. Goldens are only the shader's output over the SYNTHETIC frame, kept tiny, and are the only images the
+repo allows (`.gitignore` and `scripts/privacy-scan.sh` permit exactly `tests/golden/`).
+
+CI (`.github/workflows/ci.yml`) runs only what needs no GPU: format, clippy, the build, the unit and parser tests and the privacy scan.
+The GPU checks run locally with `scripts/regress.sh`. The test suite proves each class catches what it should: a changed colour, a
+flipped scene, a flat block, a slowed shader, a popping frame, a lurch in brightness, painted-over text, and a leaked process or temp file
+each FAIL on a deliberately broken variant (`tests/regress.rs`, `tests/pane_pty.rs`).
+
 ## Commands
 
 ```
@@ -116,6 +170,8 @@ shaderlab render FILE [--preset NAME] [--set name=value]... [--time 5]
                       [--size 1280x720] [--text sample|PATH.png]
                       [--origin top-left|bottom-left] [--out FILE.png]
 shaderlab contact-sheet FILE [--times 0,2,5] [--presets all] [--size 320x180] [--out FILE.png]
+shaderlab pane FILE [--fps 30] [--scale auto] [--stats]
+shaderlab regress [FILE|DIR...] [--fast] [--update] [--only ...]
 shaderlab check FILE|DIR... [--origin ...] [--epsilon 2] [--sharpness 0.85]
                             [--budget-ms 16.7] [--skip text,motion,animation,perf]
                             [--size WxH] [--text sample|PATH.png] [--cpu-only]

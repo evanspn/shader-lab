@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use shaderlab::check::{CheckOptions, check};
 use shaderlab::frame::Frame;
 use shaderlab::gpu::{self, Gpu, GpuError, Origin};
+use shaderlab::home;
 use shaderlab::params::{self, RenderContext};
 use shaderlab::sheet::contact_sheet;
 use shaderlab::video;
@@ -143,6 +144,76 @@ enum Cmd {
         /// Open a separate window instead of drawing in the terminal
         #[arg(long)]
         window: bool,
+    },
+    /// The shader fills the WHOLE terminal pane (no panel, no border): a living background to leave running in a split.
+    /// Keys: q quit, p pause, n/N next/previous preset, s save a PNG, ? help. Adapts its quality to keep smooth.
+    Pane {
+        file: PathBuf,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long = "set")]
+        sets: Vec<String>,
+        /// Frames per second (max 60); the pane lowers it only when it cannot keep up
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Render scale: auto (about 1080p, adapting to the load), or a fixed 0.25 to 1.0 of the pane's pixels
+        #[arg(long, default_value = "auto")]
+        scale: String,
+        /// How the picture reaches the terminal (default: detected)
+        #[arg(long, value_enum, default_value_t = ProtocolArg::Auto)]
+        protocol: ProtocolArg,
+        #[arg(long, value_enum, default_value_t = TransferArg::Auto)]
+        kitty_transfer: TransferArg,
+        /// none = the background only (default), sample = a sample terminal as iChannel0
+        #[arg(long, default_value = "none")]
+        text: String,
+        #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
+        origin: OriginArg,
+        /// Show a line with the size, scale, fps, p95 frame time and dropped frames
+        #[arg(long)]
+        stats: bool,
+        /// Stop rendering while the pane or window is not focused (saves battery)
+        #[arg(long)]
+        pause_unfocused: bool,
+        /// Restart iTime from 0 after this many seconds (keeps float precision when left running for days); 0 = never
+        #[arg(long, default_value_t = 0.0)]
+        time_wrap: f32,
+        /// Append one line per second (seconds, fps, p95 ms, scale, fps target, dropped, bytes per frame, rss KB) to this file
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
+    /// Regression checks that keep fixes and optimizations from being undone: golden pictures, orientation at five aspect
+    /// ratios, text preserved, coverage and flat blocks, temporal pops and brightness lurches, and perf against a baseline.
+    /// Exits non-zero on any failure. `--update` rewrites the goldens and the baseline and says what changed.
+    Regress {
+        /// Shader files or folders (default: examples/shaders or presets/shaders)
+        paths: Vec<PathBuf>,
+        /// Rewrite the goldens, accepted values and perf baseline instead of comparing
+        #[arg(long)]
+        update: bool,
+        /// Only these classes: golden, orient, text, coverage, temporal, perf (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// The quick subset: no perf, a short temporal run, no time-wrap probes
+        #[arg(long)]
+        fast: bool,
+        /// Where the goldens live (default: tests/golden in the repository)
+        #[arg(long)]
+        golden: Option<PathBuf>,
+        /// The perf baseline file (default: perf-baseline.json in the repository)
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
+        origin: OriginArg,
+    },
+    /// Print where shaderlab keeps renders, videos, sheets, frames and your shader library
+    Where,
+    /// Copy (or --move) existing images, videos and shaders into the shaderlab folders; originals are only read unless --move
+    Import {
+        paths: Vec<PathBuf>,
+        /// move the files instead of copying them
+        #[arg(long = "move")]
+        move_files: bool,
     },
     /// Objective checks (compiles, text preserved, animates, declared motion, speed); exits non-zero on a failure
     Check {
@@ -310,7 +381,17 @@ fn run() -> Result<ExitCode> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "shader".into());
-            let out = out.unwrap_or_else(|| PathBuf::from(format!("{stem}.png")));
+            let out = match out {
+                Some(o) => o,
+                None => home::Home::from_env().out_path(
+                    home::OutKind::Render,
+                    &home::render_stem(&stem, preset.as_deref(), (frame.width, frame.height), time),
+                    "png",
+                )?,
+            };
+            if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
             save_png(&out, frame.width, frame.height, &px)?;
             println!(
                 "wrote {} ({}x{}, t={time}s, origin {}, {})",
@@ -352,10 +433,17 @@ fn run() -> Result<ExitCode> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "shader".into());
-            let out = out.unwrap_or_else(|| match fmt {
-                video::Format::Frames => PathBuf::from(format!("{stem}-frames")),
-                f => PathBuf::from(format!("{stem}.{}", f.extension())),
-            });
+            let out = match out {
+                Some(o) => o,
+                None => {
+                    let h = home::Home::from_env();
+                    let vstem = home::video_stem(&stem, preset.as_deref(), duration);
+                    match fmt {
+                        video::Format::Frames => h.out_path(home::OutKind::Frames, &vstem, "")?,
+                        f => h.out_path(home::OutKind::Video, &vstem, f.extension())?,
+                    }
+                }
+            };
             if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
                 std::fs::create_dir_all(dir)?;
             }
@@ -450,6 +538,167 @@ fn run() -> Result<ExitCode> {
                 bail!("this build has no terminal preview: reinstall with the default features")
             }
         }
+        Cmd::Pane {
+            file,
+            preset,
+            sets,
+            fps,
+            scale,
+            protocol,
+            kitty_transfer,
+            text,
+            origin,
+            stats,
+            pause_unfocused,
+            time_wrap,
+            log,
+        } => {
+            #[cfg(feature = "tui")]
+            {
+                let scale = if scale == "auto" {
+                    shaderlab::pane::ScaleMode::Auto
+                } else {
+                    let v: f32 = scale.parse().map_err(|_| {
+                        anyhow::anyhow!(
+                            "--scale is auto or a number from 0.25 to 1.0, not {scale:?}"
+                        )
+                    })?;
+                    shaderlab::pane::ScaleMode::Fixed(v.clamp(0.25, 1.0))
+                };
+                shaderlab::pane::run(shaderlab::pane::PaneOptions {
+                    file,
+                    preset,
+                    sets,
+                    fps,
+                    scale,
+                    protocol: protocol.into(),
+                    transfer: kitty_transfer.into(),
+                    text,
+                    origin: origin.into(),
+                    stats,
+                    pause_unfocused,
+                    time_wrap,
+                    log,
+                })?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = (
+                    &file,
+                    &preset,
+                    &sets,
+                    &fps,
+                    &scale,
+                    &protocol,
+                    &kitty_transfer,
+                    &text,
+                    &origin,
+                    &stats,
+                    &pause_unfocused,
+                    &time_wrap,
+                    &log,
+                );
+                bail!("this build has no terminal pane: reinstall with the default features")
+            }
+        }
+        Cmd::Regress {
+            paths,
+            update,
+            only,
+            fast,
+            golden,
+            baseline,
+            origin,
+        } => {
+            let paths = if paths.is_empty() {
+                ["examples/shaders", "presets/shaders"]
+                    .iter()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .collect()
+            } else {
+                paths
+            };
+            let shaders = shaderlab::regress::find_shaders(&paths);
+            if shaders.is_empty() {
+                bail!("no shaders found: pass a .glsl file or a folder of them");
+            }
+            for c in &only {
+                if !shaderlab::regress::CLASSES.contains(&c.as_str()) {
+                    bail!(
+                        "--only takes {}, not {c:?}",
+                        shaderlab::regress::CLASSES.join(", ")
+                    );
+                }
+            }
+            let root = shaderlab::regress::repo_root(&shaders[0]);
+            let mut opts = shaderlab::regress::Options::for_repo(&root);
+            if let Some(g) = golden {
+                opts.golden_dir = g;
+            }
+            if let Some(b) = baseline {
+                opts.baseline = b;
+            }
+            opts.update = update;
+            opts.only = only;
+            opts.fast = fast;
+            opts.origin = origin.into();
+            let gpu = match gpu::Gpu::new() {
+                Ok(g) => g,
+                Err(e) => {
+                    println!("SKIPPED: {e}; no regression check ran");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
+            let started = std::time::Instant::now();
+            let rows = shaderlab::regress::run(&gpu, &shaders, &opts);
+            let (text, failed) = shaderlab::regress::render(&rows);
+            print!("{text}");
+            println!(
+                "({:.1} s on {})",
+                started.elapsed().as_secs_f32(),
+                gpu.adapter_name
+            );
+            Ok(if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Cmd::Where => {
+            let h = home::Home::from_env();
+            println!(
+                "home      {}   (set $SHADERLAB_HOME to move it)",
+                h.root.display()
+            );
+            println!("renders   {}   (PNG stills)", h.renders().display());
+            println!("videos    {}   (mp4, gif)", h.videos().display());
+            println!("sheets    {}   (contact sheets)", h.sheets().display());
+            println!("frames    {}   (frame folders)", h.frames().display());
+            println!("shaders   {}   (your shader library)", h.library.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Import { paths, move_files } => {
+            if paths.is_empty() {
+                bail!("name the files or folders to import");
+            }
+            let h = home::Home::from_env();
+            let r = home::import(&h, &paths, move_files)?;
+            for (from, to) in &r.imported {
+                println!(
+                    "{} {} -> {}",
+                    if move_files { "moved" } else { "copied" },
+                    from.display(),
+                    to.display()
+                );
+            }
+            for (p, why) in &r.skipped {
+                println!("skipped {}: {why}", p.display());
+            }
+            println!("{} imported, {} skipped", r.imported.len(), r.skipped.len());
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::ContactSheet {
             file,
             times,
@@ -500,7 +749,17 @@ fn run() -> Result<ExitCode> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "shader".into());
-            let out = out.unwrap_or_else(|| PathBuf::from(format!("{stem}-sheet.png")));
+            let out = match out {
+                Some(o) => o,
+                None => home::Home::from_env().out_path(
+                    home::OutKind::Sheet,
+                    &format!("{}-sheet", home::slug(&stem)),
+                    "png",
+                )?,
+            };
+            if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
             save_png(&out, w, h, &sheet)?;
             println!(
                 "wrote {} ({} frames, {}x{})",

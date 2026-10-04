@@ -17,3 +17,4 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec4 term = texture(iChannel0, uv);
     fragColor = vec4(sum / 9.0 + vec3(0.04), term.a);
 }
+// regress: skip (a deliberate fixture: blurs the text)

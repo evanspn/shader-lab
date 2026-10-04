@@ -1,0 +1,24 @@
+# GitHub's runners have no GPU, so CI runs only the checks that do not need one: formatting, lints, the build, the unit and
+# parser tests, and the privacy scan. The GPU regression checks (golden pictures, orientation, temporal, perf) run locally:
+#   scripts/regress.sh           (or `scripts/install-hooks.sh` to run the fast subset before every push)
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release
+      # GPU tests skip themselves with a message when there is no adapter; nothing here claims a GPU result
+      - run: cargo test --release
+      - run: scripts/privacy-scan.sh

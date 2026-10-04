@@ -1,0 +1,9 @@
+{
+  "machine": "Apple M3 Max / macOS 26.5.2",
+  "entries": {
+    "claims-to-animate|default|1920x1080": {"p50_ms": 0.484, "p95_ms": 0.746},
+    "rain-down|default|1920x1080": {"p50_ms": 0.483, "p95_ms": 1.181},
+    "shadertoy-glow|default|1920x1080": {"p50_ms": 0.478, "p95_ms": 0.902},
+    "vignette|default|1920x1080": {"p50_ms": 0.483, "p95_ms": 0.608}
+  }
+}

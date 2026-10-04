@@ -592,6 +592,22 @@ impl Prepared {
         (self.width, self.height)
     }
 
+    /// The time of each of `n` frames, in ms (each submitted and waited for; no readback), after a short warm-up.
+    pub fn frame_times(&self, gpu: &Gpu, n: u32) -> Result<Vec<f64>, String> {
+        let _ = self.draw(gpu, 0.0)?;
+        let mut v = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let start = Instant::now();
+            self.set_time(gpu, i as f32 * 0.0167, 0.0167, i as i32);
+            gpu.queue.submit(Some(self.encode(gpu, false)));
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| format!("GPU poll failed: {e}"))?;
+            v.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        Ok(v)
+    }
+
     /// Average milliseconds per frame over `n` frames (each submitted and waited for; no readback).
     pub fn bench(&self, gpu: &Gpu, n: u32) -> Result<f64, String> {
         let _ = self.draw(gpu, 0.0)?; // warm up
@@ -604,6 +620,266 @@ impl Prepared {
                 .map_err(|e| format!("GPU poll failed: {e}"))?;
         }
         Ok(start.elapsed().as_secs_f64() * 1000.0 / n.max(1) as f64)
+    }
+}
+
+// ---- pipelined RGBA8 streaming (the terminal pane) --------------------------------------------------------------
+
+const BLIT: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = textureLoad(src, vec2<i32>(pos.xy), 0);
+    return vec4<f32>(clamp(c.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+struct Slot {
+    buf: wgpu::Buffer,
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Frames drawn straight to RGBA8 and read back through a small ring of staging buffers WITHOUT ever waiting on the frame just
+/// submitted: [`Streamer::submit`] returns at once, and a finished frame is picked up by [`Streamer::take`] a tick or two later.
+/// Compared with the blocking f32 readback this moves a quarter of the bytes and keeps the CPU and the GPU working in parallel.
+pub struct Streamer {
+    width: u32,
+    height: u32,
+    row_bytes: u32,
+    padded: u32,
+    pipeline: wgpu::RenderPipeline,
+    bind: wgpu::BindGroup,
+    out: wgpu::Texture,
+    free: Vec<Slot>,
+    in_flight: std::collections::VecDeque<Slot>,
+    /// frames that could not be started because every staging buffer was still busy
+    pub skipped: u64,
+}
+
+impl Streamer {
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Bytes of one frame as sent to the terminal (RGBA8, no row padding).
+    pub fn frame_bytes(&self) -> usize {
+        (self.row_bytes * self.height) as usize
+    }
+
+    /// How many frames are submitted and not yet taken.
+    pub fn pending(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Start drawing the next frame. `false` = every staging buffer is busy (the GPU or the consumer is behind): the frame is
+    /// skipped and counted, never queued up.
+    pub fn submit(
+        &mut self,
+        prepared: &Prepared,
+        gpu: &Gpu,
+        time: f32,
+        delta: f32,
+        frame_no: i32,
+    ) -> bool {
+        let Some(slot) = self.free.pop() else {
+            self.skipped += 1;
+            return false;
+        };
+        prepared.set_time(gpu, time, delta, frame_no);
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // the shader draws into the Rgba32Float target; one more pass clamps it into the RGBA8 texture that is read back
+        let shader_cb = prepared.encode(gpu, false);
+        {
+            let view = self
+                .out
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, Some(&self.bind), &[]);
+            pass.draw(0..3, 0..1);
+        }
+        enc.copy_texture_to_buffer(
+            self.out.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &slot.buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([shader_cb, enc.finish()]);
+        slot.ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        let flag = slot.ready.clone();
+        slot.buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            if r.is_ok() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        self.in_flight.push_back(slot);
+        true
+    }
+
+    /// Let the GPU driver run its completion callbacks without waiting for anything.
+    pub fn poll(&self, gpu: &Gpu) {
+        let _ = gpu.device.poll(wgpu::PollType::Poll);
+    }
+
+    /// The newest finished frame, if any (older finished frames are dropped, never shown late). `f` receives the RGBA8 bytes of
+    /// each row (`width * 4` of them) in order, top row first.
+    pub fn take<R>(&mut self, f: impl FnOnce(&mut dyn Iterator<Item = &[u8]>) -> R) -> Option<R> {
+        let mut newest: Option<Slot> = None;
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|s| s.ready.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            let s = self.in_flight.pop_front().expect("just checked");
+            if let Some(old) = newest.replace(s) {
+                old.buf.unmap();
+                self.free.push(old);
+            }
+        }
+        let slot = newest?;
+        let result = {
+            let data = slot.buf.slice(..).get_mapped_range().ok()?;
+            let (rb, pad) = (self.row_bytes as usize, self.padded as usize);
+            let mut rows = (0..self.height as usize).map(|r| &data[r * pad..r * pad + rb]);
+            f(&mut rows)
+        };
+        slot.buf.unmap();
+        self.free.push(slot);
+        Some(result)
+    }
+}
+
+impl Prepared {
+    /// A pipelined RGBA8 reader for this shader's output with `ring` staging buffers.
+    pub fn streamer(&self, gpu: &Gpu, ring: usize) -> Streamer {
+        let d = &gpu.device;
+        let (w, h) = (self.width, self.height);
+        let module = d.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT.into()),
+        });
+        let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let pl = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&self.target_view()),
+            }],
+        });
+        let out = d.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rgba8"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let row_bytes = w * 4;
+        let padded = row_bytes.next_multiple_of(256);
+        let free = (0..ring.max(2))
+            .map(|_| Slot {
+                buf: d.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("stream"),
+                    size: (padded * h) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                ready: Default::default(),
+            })
+            .collect();
+        Streamer {
+            width: w,
+            height: h,
+            row_bytes,
+            padded,
+            pipeline,
+            bind,
+            out,
+            free,
+            in_flight: Default::default(),
+            skipped: 0,
+        }
     }
 }
 

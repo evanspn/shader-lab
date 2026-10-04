@@ -8,14 +8,21 @@
 
 pub mod font;
 pub mod frame;
+pub mod home;
 pub mod params;
 
 #[cfg(feature = "render")]
 pub mod check;
 #[cfg(feature = "render")]
 pub mod gpu;
+#[cfg(feature = "tui")]
+pub mod imgpane;
+#[cfg(feature = "tui")]
+pub mod pane;
 #[cfg(feature = "render")]
 pub mod preview;
+#[cfg(feature = "render")]
+pub mod regress;
 #[cfg(feature = "render")]
 pub mod sheet;
 #[cfg(feature = "tui")]

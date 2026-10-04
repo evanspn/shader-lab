@@ -636,8 +636,19 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 return;
             }
             self.saved += 1;
-            let path = PathBuf::from(format!("{}-preview-{}.png", self.name(), self.saved));
             let (pw, ph) = w.prepared.size();
+            let stem = crate::home::render_stem(
+                &self.name(),
+                self.state.preset_name(),
+                (pw, ph),
+                self.state.time,
+            );
+            let Ok(path) =
+                crate::home::Home::from_env().out_path(crate::home::OutKind::Render, &stem, "png")
+            else {
+                self.message = "could not create the renders folder".into();
+                return;
+            };
             match image::save_buffer(&path, &buf, pw, ph, image::ColorType::Rgba8) {
                 Ok(()) => self.message = format!("saved {}", path.display()),
                 Err(e) => self.message = format!("could not save {}: {e}", path.display()),
@@ -652,12 +663,15 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let (format, _) = video::choose_format(None, None, ffmpeg.is_some())
                 .unwrap_or((video::Format::Gif, None));
             self.saved += 1;
-            let out = PathBuf::from(format!(
-                "{}-preview-{}.{}",
-                self.name(),
-                self.saved,
-                format.extension()
-            ));
+            let stem = crate::home::video_stem(&self.name(), self.state.preset_name(), 5.0);
+            let Ok(out) = crate::home::Home::from_env().out_path(
+                crate::home::OutKind::Video,
+                &stem,
+                format.extension(),
+            ) else {
+                self.message = "could not create the videos folder".into();
+                return;
+            };
             let report = video::render_video(
                 &w.wg.gpu,
                 &w.prepared,

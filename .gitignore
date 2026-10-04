@@ -7,3 +7,7 @@
 *.gif
 *.bmp
 *.ppm
+# ... except the regression goldens: the shader's output over the SYNTHETIC terminal frame, tiny, under tests/golden only
+!/tests/golden/
+!/tests/golden/**/
+!/tests/golden/**/*.png

@@ -18,3 +18,4 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float streak = on * step(0.0, behindHead) * step(behindHead, 90.0) * (1.0 - behindHead / 90.0);
     fragColor = vec4(term.rgb + vec3(0.4, 0.6, 1.0) * streak * behind * 0.8, term.a);
 }
+// regress: skip (a deliberate fixture: declares the wrong motion direction)

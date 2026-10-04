@@ -389,8 +389,24 @@ impl App {
             return;
         }
         self.saved += 1;
-        let path = PathBuf::from(format!("{}-preview-{}.png", self.name(), self.saved));
         let (w, h) = p.size();
+        let stem = crate::home::render_stem(
+            &self.name(),
+            self.state.preset_name(),
+            (w, h),
+            self.state.time,
+        );
+        let path = match crate::home::Home::from_env().out_path(
+            crate::home::OutKind::Render,
+            &stem,
+            "png",
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.message = format!("could not create the renders folder: {e}");
+                return;
+            }
+        };
         self.message = match image::save_buffer(&path, &buf, w, h, image::ColorType::Rgba8) {
             Ok(()) => format!("saved {}", path.display()),
             Err(e) => format!("could not save {}: {e}", path.display()),
@@ -405,12 +421,18 @@ impl App {
         let (format, _) = video::choose_format(None, None, ffmpeg.is_some())
             .unwrap_or((video::Format::Gif, None));
         self.saved += 1;
-        let out = PathBuf::from(format!(
-            "{}-preview-{}.{}",
-            self.name(),
-            self.saved,
-            format.extension()
-        ));
+        let stem = crate::home::video_stem(&self.name(), self.state.preset_name(), 5.0);
+        let out = match crate::home::Home::from_env().out_path(
+            crate::home::OutKind::Video,
+            &stem,
+            format.extension(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.message = format!("could not create the videos folder: {e}");
+                return;
+            }
+        };
         let r = video::render_video(
             &self.gpu,
             p,
