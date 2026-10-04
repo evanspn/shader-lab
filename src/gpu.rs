@@ -171,6 +171,13 @@ pub struct Gpu {
     pub adapter_name: String,
 }
 
+/// A GPU that can also present to a window surface (the live preview).
+pub struct WindowGpu {
+    pub gpu: Gpu,
+    pub adapter: wgpu::Adapter,
+    pub instance: wgpu::Instance,
+}
+
 impl Gpu {
     pub fn new() -> Result<Gpu, GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -186,6 +193,46 @@ impl Gpu {
             queue,
             adapter_name,
         })
+    }
+
+    /// Like [`Gpu::new`], but with an adapter that can draw to `target` (a window). The surface is created by the caller
+    /// through the returned instance.
+    pub fn for_window<'w>(
+        target: impl Into<wgpu::SurfaceTarget<'w>>,
+    ) -> Result<(WindowGpu, wgpu::Surface<'w>), GpuError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance
+            .create_surface(target)
+            .map_err(|e| GpuError::NoAdapter(format!("could not create a window surface: {e}")))?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        }))
+        .map_err(|e| GpuError::NoAdapter(e.to_string()))?;
+        let adapter_name = adapter.get_info().name;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .map_err(|e| GpuError::Device(e.to_string()))?;
+        Ok((
+            WindowGpu {
+                gpu: Gpu {
+                    device,
+                    queue,
+                    adapter_name,
+                },
+                adapter,
+                instance,
+            },
+            surface,
+        ))
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
     }
 
     /// Compile `src` and set everything up to draw it over `frame`. A shader error is returned as text,
@@ -351,7 +398,9 @@ impl Gpu {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let padded = (w * 16).next_multiple_of(256);
@@ -389,7 +438,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    fn set_time(&self, gpu: &Gpu, time: f32, frame_no: i32) {
+    fn set_time(&self, gpu: &Gpu, time: f32, delta: f32, frame_no: i32) {
         let mut g = [0u8; 64];
         let put = |b: &mut [u8; 64], off: usize, v: f32| {
             b[off..off + 4].copy_from_slice(&v.to_le_bytes())
@@ -398,7 +447,7 @@ impl Prepared {
         put(&mut g, 4, self.height as f32);
         put(&mut g, 8, 1.0);
         put(&mut g, 12, time);
-        put(&mut g, 16, 1.0 / 60.0);
+        put(&mut g, 16, delta);
         g[20..24].copy_from_slice(&frame_no.to_le_bytes());
         gpu.queue.write_buffer(&self.globals, 0, &g);
     }
@@ -454,7 +503,53 @@ impl Prepared {
 
     /// Draw one frame at `time` seconds; RGBA f32 (not clamped), top row first.
     pub fn draw(&self, gpu: &Gpu, time: f32) -> Result<Vec<f32>, String> {
-        self.set_time(gpu, time, (time * 60.0) as i32);
+        self.draw_at(gpu, time, 1.0 / 60.0, (time * 60.0) as i32)
+    }
+
+    /// Like [`draw`](Self::draw) with the time uniforms chosen by the caller: `iTime`, `iTimeDelta` and `iFrame`.
+    pub fn draw_at(
+        &self,
+        gpu: &Gpu,
+        time: f32,
+        delta: f32,
+        frame_no: i32,
+    ) -> Result<Vec<f32>, String> {
+        let mut out = Vec::new();
+        self.draw_into(gpu, time, delta, frame_no, &mut out)?;
+        Ok(out)
+    }
+
+    /// Draw a frame and write it as RGBA8 into `out` (reused between calls: video rendering allocates once).
+    pub fn draw_rgba8(
+        &self,
+        gpu: &Gpu,
+        time: f32,
+        delta: f32,
+        frame_no: i32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let mut px = Vec::new();
+        self.draw_into(gpu, time, delta, frame_no, &mut px)?;
+        out.clear();
+        out.extend(px.iter().map(|v| {
+            if v.is_nan() {
+                0
+            } else {
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+        }));
+        Ok(())
+    }
+
+    fn draw_into(
+        &self,
+        gpu: &Gpu,
+        time: f32,
+        delta: f32,
+        frame_no: i32,
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        self.set_time(gpu, time, delta, frame_no);
         gpu.queue.submit(Some(self.encode(gpu, true)));
         let slice = self.readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| {
@@ -466,7 +561,8 @@ impl Prepared {
         let data = slice
             .get_mapped_range()
             .map_err(|e| format!("could not read the frame back: {e}"))?;
-        let mut out = Vec::with_capacity((self.width * self.height * 4) as usize);
+        out.clear();
+        out.reserve((self.width * self.height * 4) as usize);
         for row in 0..self.height {
             let start = (row * self.padded) as usize;
             let bytes = &data[start..start + (self.width * 16) as usize];
@@ -478,7 +574,22 @@ impl Prepared {
         }
         drop(data);
         self.readback.unmap();
-        Ok(out)
+        Ok(())
+    }
+
+    /// Draw a frame into the internal Rgba32Float target without reading it back (the live preview presents it).
+    pub fn render_only(&self, gpu: &Gpu, time: f32, delta: f32, frame_no: i32) {
+        self.set_time(gpu, time, delta, frame_no);
+        gpu.queue.submit(Some(self.encode(gpu, false)));
+    }
+
+    pub fn target_view(&self) -> wgpu::TextureView {
+        self.target
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// Average milliseconds per frame over `n` frames (each submitted and waited for; no readback).
@@ -486,7 +597,7 @@ impl Prepared {
         let _ = self.draw(gpu, 0.0)?; // warm up
         let start = Instant::now();
         for i in 0..n {
-            self.set_time(gpu, i as f32 * 0.0167, i as i32);
+            self.set_time(gpu, i as f32 * 0.0167, 0.0167, i as i32);
             gpu.queue.submit(Some(self.encode(gpu, false)));
             gpu.device
                 .poll(wgpu::PollType::wait_indefinitely())
@@ -494,6 +605,26 @@ impl Prepared {
         }
         Ok(start.elapsed().as_secs_f64() * 1000.0 / n.max(1) as f64)
     }
+}
+
+/// The real parameter header (exactly what applying a profile writes), then the GPU pipeline for `src` over `frame`.
+pub fn prepare_shader(
+    gpu: &Gpu,
+    src: &str,
+    preset: Option<&str>,
+    sets: &[String],
+    frame: &Frame,
+    origin: Origin,
+) -> Result<Prepared, String> {
+    use crate::params::{self, RenderContext};
+    let schema = params::parse_schema(params::strip_header(src))?;
+    let values = params::values_from_args(&schema, preset, sets)?;
+    let ctx = RenderContext {
+        background: frame.background,
+        ..RenderContext::default()
+    };
+    let text = params::render_ctx(src, &values, &ctx)?;
+    gpu.prepare(&text, frame, origin)
 }
 
 /// f32 RGBA -> RGBA8 (clamped, rounded). NaN becomes 0.

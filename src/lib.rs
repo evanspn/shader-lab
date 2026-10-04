@@ -4,7 +4,7 @@
 //! * [`frame`]: the synthetic terminal frame a shader is run over (and its text mask).
 //! * [`font`]: the embedded bitmap font that draws it.
 //! * With the default `render` feature: [`gpu`] (run a shader with wgpu), [`check`] (objective checks)
-//!   and [`sheet`] (contact sheets).
+//!   [`sheet`] (contact sheets) and [`video`] (many frames in one GPU session, to mp4/gif/PNG frames).
 
 pub mod font;
 pub mod frame;
@@ -15,4 +15,8 @@ pub mod check;
 #[cfg(feature = "render")]
 pub mod gpu;
 #[cfg(feature = "render")]
+pub mod preview;
+#[cfg(feature = "render")]
 pub mod sheet;
+#[cfg(feature = "render")]
+pub mod video;

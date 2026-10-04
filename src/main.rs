@@ -9,6 +9,7 @@ use shaderlab::frame::Frame;
 use shaderlab::gpu::{self, Gpu, GpuError, Origin};
 use shaderlab::params::{self, RenderContext};
 use shaderlab::sheet::contact_sheet;
+use shaderlab::video;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OriginArg {
@@ -82,6 +83,54 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Render many frames in one GPU session and encode them: mp4 (needs ffmpeg), a GIF, or a folder of PNGs
+    Video {
+        file: PathBuf,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long = "set")]
+        sets: Vec<String>,
+        #[arg(long, default_value = "1280x720")]
+        size: String,
+        /// Frames per second (a GIF is capped at 20)
+        #[arg(long, default_value_t = 24)]
+        fps: u32,
+        /// Seconds of video
+        #[arg(long, default_value_t = 10.0)]
+        duration: f32,
+        /// iTime of the first frame, in seconds
+        #[arg(long, default_value_t = 0.0)]
+        start: f32,
+        #[arg(long, default_value = "sample")]
+        text: String,
+        #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
+        origin: OriginArg,
+        /// mp4, gif or frames (default: from the output name, else mp4 when ffmpeg is installed, else gif)
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
+        /// Cross-fade the last second into the first so the clip loops without a jump
+        #[arg(long)]
+        loop_seamless: bool,
+        /// Output file (default ./NAME.mp4 or .gif); for --format frames, a folder
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// A live window: the shader running in real time over the terminal frame, with hot reload and keys
+    /// (space pause, [ ] speed, R reset, T terminal on/off, P presets, 1-9 or arrows to pick and change a parameter,
+    /// S save a PNG, V record 5 s, Q quit)
+    Preview {
+        file: PathBuf,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long = "set")]
+        sets: Vec<String>,
+        #[arg(long, default_value = "1280x720")]
+        size: String,
+        #[arg(long, default_value = "sample")]
+        text: String,
+        #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
+        origin: OriginArg,
+    },
     /// Objective checks (compiles, text preserved, animates, declared motion, speed); exits non-zero on a failure
     Check {
         /// Shader files, or folders (every .glsl directly inside is checked)
@@ -110,6 +159,13 @@ enum Cmd {
         #[arg(long)]
         cpu_only: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum FormatArg {
+    Mp4,
+    Gif,
+    Frames,
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -142,6 +198,18 @@ fn save_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
 
 fn read_shader(file: &Path) -> Result<String> {
     std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))
+}
+
+/// The real parameter header, then the GPU pipeline for `src` over `frame`.
+fn prepare_shader(
+    gpu: &Gpu,
+    src: &str,
+    preset: Option<&str>,
+    sets: &[String],
+    frame: &Frame,
+    origin: Origin,
+) -> Result<gpu::Prepared> {
+    gpu::prepare_shader(gpu, src, preset, sets, frame, origin).map_err(anyhow::Error::msg)
 }
 
 /// Render one frame: the real parameter header, then the GPU.
@@ -201,6 +269,106 @@ fn run() -> Result<ExitCode> {
                 gpu.adapter_name
             );
             Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Video {
+            file,
+            preset,
+            sets,
+            size,
+            fps,
+            duration,
+            start,
+            text,
+            origin,
+            format,
+            loop_seamless,
+            out,
+        } => {
+            if fps == 0 || !(0.1..=600.0).contains(&duration) {
+                bail!("--fps must be at least 1 and --duration between 0.1 and 600 seconds");
+            }
+            let src = read_shader(&file)?;
+            let frame = frame_for(&text, parse_size(&size)?)?;
+            let ffmpeg = video::find_ffmpeg();
+            let explicit = format.map(|f| match f {
+                FormatArg::Mp4 => video::Format::Mp4,
+                FormatArg::Gif => video::Format::Gif,
+                FormatArg::Frames => video::Format::Frames,
+            });
+            let (fmt, note) = video::choose_format(explicit, out.as_deref(), ffmpeg.is_some())?;
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "shader".into());
+            let out = out.unwrap_or_else(|| match fmt {
+                video::Format::Frames => PathBuf::from(format!("{stem}-frames")),
+                f => PathBuf::from(format!("{stem}.{}", f.extension())),
+            });
+            if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            let gpu = open_gpu()?;
+            let prepared =
+                prepare_shader(&gpu, &src, preset.as_deref(), &sets, &frame, origin.into())?;
+            if let Some(n) = note {
+                eprintln!("note: {n}");
+            }
+            let report = video::render_video(
+                &gpu,
+                &prepared,
+                &video::VideoOptions {
+                    fps,
+                    duration,
+                    start,
+                    format: fmt,
+                    out,
+                    loop_seamless,
+                    ffmpeg,
+                },
+            )?;
+            for n in &report.notes {
+                eprintln!("note: {n}");
+            }
+            println!(
+                "wrote {} ({} frames, {}x{} at {} fps, {:.1}s of rendering, {:.1} ms per frame, {})",
+                report.path.display(),
+                report.frames,
+                report.size.0,
+                report.size.1,
+                report.fps,
+                report.render_secs,
+                report.ms_per_frame,
+                gpu.adapter_name
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Preview {
+            file,
+            preset,
+            sets,
+            size,
+            text,
+            origin,
+        } => {
+            #[cfg(feature = "preview")]
+            {
+                shaderlab::preview::run(shaderlab::preview::PreviewOptions {
+                    file,
+                    preset,
+                    sets,
+                    size: parse_size(&size)?,
+                    text,
+                    origin: origin.into(),
+                })?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(not(feature = "preview"))]
+            {
+                let _ = (file, preset, sets, size, text, origin);
+                bail!(
+                    "this build has no live preview: reinstall with `cargo install --git https://github.com/evanspn/shader-lab --features preview`"
+                )
+            }
         }
         Cmd::ContactSheet {
             file,

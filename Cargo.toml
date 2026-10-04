@@ -20,9 +20,11 @@ path = "src/main.rs"
 required-features = ["render"]
 
 [features]
-default = ["render"]
+default = ["render", "preview"]
 # The GPU renderer, the checker and the CLI. Without it only the parameter annotation library is built.
-render = ["dep:wgpu", "dep:pollster", "dep:image", "dep:clap", "dep:anyhow"]
+render = ["dep:wgpu", "dep:pollster", "dep:image", "dep:clap", "dep:anyhow", "dep:gif"]
+# A live window (winit) that runs the shader in real time with hot reload: `shaderlab preview`.
+preview = ["render", "dep:winit"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
@@ -30,6 +32,8 @@ clap = { version = "4", features = ["derive"], optional = true }
 pollster = { version = "1", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 wgpu = { version = "30", default-features = false, features = ["glsl", "wgsl"], optional = true }
+gif = { version = "0.13", optional = true }
+winit = { version = "0.30.13", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }

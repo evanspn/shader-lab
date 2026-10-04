@@ -19,6 +19,7 @@ const TEXT_COVERAGE: f32 = 0.85;
 /// For a loaded image, pixels this much brighter than the background count as text.
 const IMAGE_TEXT_LUMINANCE_ABOVE_BG: f32 = 0.45;
 
+#[derive(Clone)]
 pub struct Frame {
     /// The terminal's background color: what a pixel with nothing drawn on it looks like.
     pub background: (u8, u8, u8),
@@ -193,6 +194,21 @@ impl Frame {
     }
 
     /// The generic synthetic terminal: about 30 lines of colored text, a selection highlight and a cursor.
+    /// The same frame with nothing drawn on it: just the background color (the preview's "T" key).
+    pub fn without_text(&self) -> Frame {
+        let mut rgba = Vec::with_capacity(self.rgba.len());
+        for _ in 0..self.rgba.len() / 4 {
+            rgba.extend_from_slice(&[self.background.0, self.background.1, self.background.2, 255]);
+        }
+        Frame {
+            background: self.background,
+            width: self.width,
+            height: self.height,
+            rgba,
+            text: vec![false; self.text.len()],
+        }
+    }
+
     pub fn sample(width: u32, height: u32) -> Frame {
         let mut f = Frame::blank(width, height);
         let scale = (height / 360).max(1);

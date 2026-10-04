@@ -9,6 +9,8 @@ and moves the way it says it does.
 ```
 shaderlab render FILE         one frame to a PNG
 shaderlab contact-sheet FILE  a grid: one row per preset, one column per time
+shaderlab video FILE          many frames in one GPU session: mp4 (ffmpeg), GIF or PNG frames
+shaderlab preview FILE        a live window with hot reload and keys
 shaderlab check FILE...       objective checks; exit code 1 if any fails
 ```
 
@@ -36,6 +38,57 @@ the shader the way Ghostty does; `--origin bottom-left` runs it as written for
 Shadertoy. In a generated header `gp_yup()` tells a shader which one is active.
 `check` verifies a declared `@motion` against the motion it measures in the
 picture, in the origin you chose.
+
+## Video
+
+```
+shaderlab video FILE [--preset X] [--set k=v]... [--size 1280x720] [--fps 24] [--duration 10] [--start 0]
+                     [--text sample|PATH.png] [--origin top-left|bottom-left]
+                     [--format mp4|gif|frames] [--loop-seamless] [--out out.mp4]
+```
+
+All frames are rendered in one GPU session (the device and pipeline are created once; each frame only updates `iTime`,
+`iTimeDelta` and `iFrame`), so 10 seconds at 720p takes a couple of seconds. Frame N has `iTime = start + N/fps`, and `iFrame`
+counts output frames from 0.
+
+* **mp4** streams the frames to `ffmpeg` (H.264, `yuv420p`, `+faststart`, an odd size is trimmed to even) so it plays on an iPhone and in
+  iMessage. **This needs ffmpeg**: `brew install ffmpeg`.
+* **gif** is the fallback when ffmpeg is not installed (or with `--format gif`): palette-quantized, capped at 20 fps and 640 px wide, and
+  it says so.
+* **frames** writes `frame-00000.png`... into the `--out` folder.
+* `--format` is picked from the output extension, else mp4 when ffmpeg is installed, else gif.
+* `--loop-seamless` cross-fades the last second into the first so the clip loops without a jump.
+
+```
+shaderlab video examples/shaders/rain-down.glsl --duration 10 --out rain.mp4
+shaderlab video my.glsl --preset storm --size 1290x2796 --text blank-frame.png --out phone.mp4
+SHADERLAB_NO_FFMPEG=1 shaderlab video my.glsl --out quick.gif      # force the GIF path
+```
+
+## Live preview
+
+```
+shaderlab preview FILE [--preset X] [--set k=v]... [--size 1280x720] [--text sample|PATH.png] [--origin ...]
+```
+
+A window shows the shader running in real time over the synthetic terminal frame. Save the file in your editor and it reloads; a
+compile error shows in the window title and in the terminal while the last good shader keeps running.
+
+| key | does |
+| --- | --- |
+| space | pause / resume |
+| `[` `]` | slower / faster |
+| `R` | reset time to 0 |
+| `T` | terminal frame / plain background |
+| `P` | cycle the presets (and back to the defaults) |
+| `1`-`9`, up/down | pick a parameter (prints its name and value) |
+| left/right | change the picked parameter (numbers by a 20th of their range, colours by 15 degrees of hue) |
+| `S` | save a PNG (`NAME-preview-N.png`) |
+| `V` | record 5 seconds (mp4 with ffmpeg, else GIF) |
+| `Q` / Esc | quit |
+
+The title shows the preset, time, speed and frames per second. With no display or GPU it exits with a clear error. The preview is
+on by default; to build without the window libraries use `cargo install --git https://github.com/evanspn/shader-lab --no-default-features --features render`.
 
 ## Commands
 

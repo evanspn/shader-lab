@@ -208,3 +208,22 @@ fn check_on_the_gpu_exits_zero_for_a_good_shader_and_one_for_a_bad_one() {
     ]);
     assert!(skipped.status.success(), "{}", text(&skipped.stdout));
 }
+
+#[test]
+fn preview_and_video_report_bad_input_as_plain_errors() {
+    for args in [
+        vec!["preview", "/nope/missing.glsl"],
+        vec!["video", "/nope/missing.glsl"],
+        vec!["video", "x.glsl", "--fps", "0"],
+        vec!["video", "x.glsl", "--duration", "9999"],
+    ] {
+        let o = run(&args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", text(&o.stderr));
+        assert!(
+            text(&o.stderr).starts_with("error:"),
+            "{args:?}: {}",
+            text(&o.stderr)
+        );
+        assert!(!text(&o.stderr).contains("panicked"));
+    }
+}
