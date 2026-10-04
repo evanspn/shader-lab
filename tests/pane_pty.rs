@@ -46,8 +46,8 @@ fn run_pane(args: &[&str], wait: Duration, keys: &[u8], kill: bool) -> Run {
         })
         .unwrap();
     let mut cmd = CommandBuilder::new(BIN);
-    cmd.arg("pane");
     cmd.args(args);
+    cmd.env("SHADERLAB_NO_EXEC", "1");
     cmd.env("TERM", "xterm-256color");
     cmd.env_remove("TMUX");
     let mut child = pair.slave.spawn_command(cmd).unwrap();
@@ -124,6 +124,7 @@ fn the_pane_replaces_one_image_in_place_inside_synchronized_updates_and_leaves_n
     }
     let r = run_pane(
         &[
+            "pane",
             &example("vignette.glsl"),
             "--protocol",
             "kitty",
@@ -193,6 +194,7 @@ fn ctrl_c_quits_the_pane_cleanly_too() {
     }
     let r = run_pane(
         &[
+            "pane",
             &example("vignette.glsl"),
             "--protocol",
             "kitty",
@@ -227,6 +229,7 @@ fn a_pane_that_was_killed_leaves_files_that_the_next_pane_cleans_up() {
         .unwrap();
     let r = run_pane(
         &[
+            "pane",
             &example("vignette.glsl"),
             "--protocol",
             "kitty",
@@ -254,6 +257,7 @@ fn a_tiny_pane_and_a_bad_shader_do_not_panic() {
     std::fs::write(&bad, "void mainImage(out vec4 c, in vec2 f) { c = nope; }").unwrap();
     let r = run_pane(
         &[
+            "pane",
             bad.to_str().unwrap(),
             "--protocol",
             "kitty",
@@ -286,6 +290,7 @@ fn a_pane_given_sigkill_is_gone_and_frame_files_are_only_what_the_stale_cleanup_
     }
     let r = run_pane(
         &[
+            "pane",
             &example("vignette.glsl"),
             "--protocol",
             "kitty",
@@ -300,4 +305,46 @@ fn a_pane_given_sigkill_is_gone_and_frame_files_are_only_what_the_stale_cleanup_
     for f in frame_files(r.pid) {
         let _ = std::fs::remove_file(std::env::temp_dir().join(f));
     }
+}
+
+#[test]
+fn the_browser_opens_with_no_arguments_takes_keys_quits_zero_and_restores_the_terminal() {
+    if !have_gpu() {
+        eprintln!("SKIPPED: no GPU adapter; nothing was verified by this test");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("renders")).unwrap();
+    image::save_buffer(
+        home.path().join("renders/sample-render.png"),
+        &[200u8; 12],
+        2,
+        2,
+        image::ColorType::Rgb8,
+    )
+    .unwrap();
+    // the browser reads $SHADERLAB_HOME; the pty child inherits this process's environment
+    unsafe { std::env::set_var("SHADERLAB_HOME", home.path()) };
+    let r = run_pane(
+        &["browse", "--protocol", "halfblocks"],
+        Duration::from_millis(1500),
+        b"q",
+        false,
+    );
+    unsafe { std::env::remove_var("SHADERLAB_HOME") };
+    assert_eq!(
+        r.code,
+        Some(0),
+        "{:?}",
+        r.out.chars().take(300).collect::<String>()
+    );
+    for t in ["Shaders", "Renders", "Videos", "Sheets"] {
+        assert!(r.out.contains(t), "{t} not on screen");
+    }
+    assert!(r.out.contains("vignette"), "the built-in shaders are listed");
+    assert!(
+        r.out.contains("\x1b[?1049l") && r.out.contains("\x1b[?25h"),
+        "the terminal is restored"
+    );
+    assert!(!r.out.contains("panicked"));
 }

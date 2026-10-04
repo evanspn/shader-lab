@@ -109,6 +109,35 @@ The mouse works too: click or drag a number's bar, click a color's swatch to ope
 The terminal is restored (alternate screen, mouse, cursor, kitty image) on quit, Ctrl-C and panic. With no GPU it exits with a
 clear error. Build without the terminal UI or the window with `--no-default-features --features render`.
 
+## Where everything lives, and the browser
+
+`shaderlab` keeps what it makes in one place: `$SHADERLAB_HOME` (default `~/Pictures/shaderlab`) with `renders/` (PNG stills), `videos/`,
+`sheets/` and `frames/`, and your own shaders in `~/.config/shaderlab/shaders` (the shipped examples are shown beside them, read-only).
+Every command writes into the right subfolder by default, named `<shader>-<preset>-<size>-t<time>.png` or `<shader>-<preset>-<seconds>s.mp4`,
+never overwriting (`-2`, `-3`); an explicit `--out` is always honoured. `shaderlab where` prints the folders; `shaderlab import PATH...`
+copies images, videos and shaders in (originals are only read; `--move` moves them).
+
+`shaderlab` with no arguments (or `shaderlab browse [DIR]`) opens a [Ratatui](https://ratatui.rs) browser: tabs **Shaders | Renders | Videos |
+Sheets** (or one list of everything in `DIR`), a list with name, size and date on the left, a live preview on the right (pictures through
+kitty / sixel / half-blocks like `preview`, gif and video played frame by frame with ffmpeg and looped, shaders rendered live).
+
+| key | does |
+| --- | --- |
+| up / down, `j` / `k`, PgUp / PgDn, `g` / `G` | move |
+| Tab / Shift-Tab, `1`-`4` | switch tab |
+| `/` | filter (Enter keeps it, Esc clears) |
+| `s` / `S` | next sort (name, date, size) / reverse |
+| Enter | a shader: its full `preview`; a picture or video: full-size view (Esc back, space pauses) |
+| `r` / `v` | render a still / record a video of the selected shader |
+| `e` | edit in `$EDITOR` (a built-in is copied into your library first) |
+| `o` / `c` | reveal in Finder (`open -R`) / copy the path |
+| `d` | move to the Trash after a confirmation (never deletes; a built-in cannot be removed) |
+| `i` | import files (paths separated by `;`) |
+| `?` / `q` | help / quit |
+
+The mouse works: click a tab or a row, scroll the wheel. A folder with thousands of files is listed lazily (the first 500 are shown, and it says so);
+a corrupt or empty file shows a note instead of an error. The terminal is restored on every exit path.
+
 ## A living background: `shaderlab pane`
 
 ```

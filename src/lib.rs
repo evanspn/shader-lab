@@ -11,6 +11,8 @@ pub mod frame;
 pub mod home;
 pub mod params;
 
+#[cfg(feature = "tui")]
+pub mod browser;
 #[cfg(feature = "render")]
 pub mod check;
 #[cfg(feature = "render")]

@@ -35,8 +35,9 @@ Pass --origin to say which convention a shader was written for (default: top-lef
 #[derive(Parser)]
 #[command(name = "shaderlab", version, about = "Render, preview and check Ghostty/Shadertoy-style terminal shaders headlessly", after_help = ORIENTATION)]
 struct Cli {
+    /// With no command, `shaderlab` opens the browser (the same as `shaderlab browse`)
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -206,6 +207,18 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
         origin: OriginArg,
     },
+    /// Browse your shaders, renders, videos and sheets in the terminal (the default when you run `shaderlab` alone): a list with a live
+    /// preview. Enter opens a shader's full preview or a picture / video full size; r renders a still, v records a video, e edits,
+    /// o reveals in Finder, c copies the path, d moves to the Trash (never deletes), i imports, / filters, ? is the full help.
+    Browse {
+        /// A folder to browse instead of the shaderlab home
+        dir: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = ProtocolArg::Auto)]
+        protocol: ProtocolArg,
+        /// Frames per second of the preview animation (5 to 30)
+        #[arg(long, default_value_t = 15)]
+        fps: u32,
+    },
     /// Print where shaderlab keeps renders, videos, sheets, frames and your shader library
     Where,
     /// Copy (or --move) existing images, videos and shaders into the shaderlab folders; originals are only read unless --move
@@ -361,7 +374,11 @@ fn render_frame(
 }
 
 fn run() -> Result<ExitCode> {
-    match Cli::parse().command {
+    match Cli::parse().command.unwrap_or(Cmd::Browse {
+        dir: None,
+        protocol: ProtocolArg::Auto,
+        fps: 15,
+    }) {
         Cmd::Render {
             file,
             preset,
@@ -665,6 +682,22 @@ fn run() -> Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Cmd::Browse { dir, protocol, fps } => {
+            #[cfg(feature = "tui")]
+            {
+                shaderlab::browser::run(shaderlab::browser::Browse {
+                    dir,
+                    protocol: protocol.into(),
+                    fps,
+                })?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = (&dir, &protocol, &fps);
+                bail!("this build has no terminal browser: reinstall with the default features")
+            }
         }
         Cmd::Where => {
             let h = home::Home::from_env();
