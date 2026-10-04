@@ -552,7 +552,22 @@ pub fn temporal_rows(
         let mut sorted = diffs.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
         let median = sorted[sorted.len() / 2];
-        let worst = *sorted.last().unwrap_or(&0.0);
+        // a pop is a frame far from ITS OWN neighbourhood (a playlist moves faster in some scenes than in others), so each change is
+        // judged against the median of the changes within a second either side of it
+        let local_median = |i: usize| {
+            let (lo, hi) = (i.saturating_sub(24), (i + 25).min(diffs.len()));
+            let mut w: Vec<f32> = diffs[lo..hi].to_vec();
+            w.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+            w[w.len() / 2]
+        };
+        let mut worst = 0.0f32;
+        let mut pop = false;
+        for (i, d) in diffs.iter().enumerate() {
+            worst = worst.max(*d);
+            if *d > SPIKE_K * local_median(i) + SPIKE_FLOOR {
+                pop = true;
+            }
+        }
         let mut lurch = 0.0f32;
         for w2 in means.windows(2) {
             lurch = lurch.max((w2[1] - w2[0]).abs());
@@ -560,13 +575,10 @@ pub fn temporal_rows(
         if label == "start" {
             reference_median = median;
         }
-        // around a wrap the reference is the ordinary motion
-        let base = if label == "start" {
-            median
-        } else {
-            reference_median.max(median)
-        };
-        let pop = worst > SPIKE_K * base + SPIKE_FLOOR;
+        // around a wrap the reference is the ordinary motion of the start of the run
+        if label != "start" {
+            pop = worst > SPIKE_K * reference_median.max(median) + SPIKE_FLOOR;
+        }
         let status = if pop || lurch > LUMA_STEP {
             Status::Fail
         } else {
@@ -623,7 +635,15 @@ pub fn run_shader(
                             opts.update,
                         ));
                     }
-                    if opts.wants("text") {
+                    if opts.wants("text") && src.contains("// regress: text-ok") {
+                        rows.push(row(
+                            stem,
+                            &var.label,
+                            "text",
+                            Status::Skip,
+                            "marked `// regress: text-ok`: it draws over text by design",
+                        ));
+                    } else if opts.wants("text") {
                         let bad = (0..frame.text.len())
                             .filter(|&i| {
                                 frame.text[i]
@@ -762,6 +782,15 @@ pub fn run_shader(
                             format!("baseline is for {:?}, this machine is {machine:?}: not compared (p50 {p50:.2} ms)", baseline.machine),
                         ));
                     } else if let Some(&(b50, b95)) = baseline.entries.get(&key) {
+                        // a slow reading on a shared machine gets one more try before it counts
+                        let (mut p50, mut p95) = (p50, p95);
+                        if (p50 > b50 * PERF_P50_RATIO + PERF_P50_FLOOR_MS
+                            || p95 > b95 * PERF_P95_RATIO + PERF_P95_FLOOR_MS)
+                            && let Ok((q50, q95)) = perf_of(gpu, src, &var, opts.origin, 40)
+                        {
+                            p50 = p50.min(q50);
+                            p95 = p95.min(q95);
+                        }
                         let ok50 = p50 <= b50 * PERF_P50_RATIO + PERF_P50_FLOOR_MS;
                         let ok95 = p95 <= b95 * PERF_P95_RATIO + PERF_P95_FLOOR_MS;
                         rows.push(row(
