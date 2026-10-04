@@ -39,11 +39,23 @@ pub struct TuiOptions {
     pub text: String,
     pub origin: Origin,
     pub fps: u32,
+    /// how the kitty picture travels: a temp file the terminal reads (fast, local only) or base64 over the pty
+    pub transfer: Transfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transfer {
+    /// a file when the terminal is on this machine, base64 otherwise
+    Auto,
+    File,
+    Direct,
 }
 
 const KITTY_ID: u32 = 4242;
 /// The largest picture sent over the terminal link, per protocol.
-const KITTY_MAX: (u32, u32) = (960, 540);
+/// The largest picture sent: bigger when it travels as a file (the link carries only a path), smaller when it is base64 over the pty.
+const KITTY_MAX_FILE: (u32, u32) = (960, 540);
+const KITTY_MAX_DIRECT: (u32, u32) = (640, 360);
 const SIXEL_MAX: (u32, u32) = (640, 360);
 const PANEL_WIDTH: u16 = 38;
 /// Half-block pictures are rendered this many times finer than the cell grid.
@@ -88,17 +100,17 @@ pub fn layout(area: Rect) -> Layout2 {
 }
 
 /// The pixel size to render for `image` cells: exact cells x 2 for half-blocks, the real cell size for graphics (capped).
-pub fn pixel_size(proto: Protocol, image: Rect, cell_px: (f32, f32)) -> (u32, u32) {
+pub fn pixel_size(proto: Protocol, image: Rect, cell_px: (f32, f32), via_file: bool) -> (u32, u32) {
     let (cols, rows) = (image.width.max(1) as f32, image.height.max(1) as f32);
     match proto {
         // rendered 4x finer than the cell grid and averaged down: the sample terminal's text stays readable
         Protocol::HalfBlocks => (cols as u32 * SS, rows as u32 * 2 * SS),
         Protocol::Kitty | Protocol::Sixel => {
             let (w, h) = (cols * cell_px.0, rows * cell_px.1);
-            let max = if proto == Protocol::Kitty {
-                KITTY_MAX
-            } else {
-                SIXEL_MAX
+            let max = match (proto, via_file) {
+                (Protocol::Kitty, true) => KITTY_MAX_FILE,
+                (Protocol::Kitty, false) => KITTY_MAX_DIRECT,
+                _ => SIXEL_MAX,
             };
             let k = (max.0 as f32 / w).min(max.1 as f32 / h).min(1.0);
             (
@@ -245,6 +257,10 @@ struct App {
     ms: f32,
     meter: (Instant, u32),
     kitty_shown: bool,
+    /// frames the loop could not keep up with (it skips instead of bursting)
+    dropped: u64,
+    file_slot: usize,
+    use_file: bool,
 }
 
 fn style_dim() -> Style {
@@ -658,8 +674,8 @@ impl App {
                 if st.show_terminal { "" } else { "  black" }
             )),
             Line::from(format!(
-                "{:.0} fps  {:.1} ms  {}x{}",
-                self.fps, self.ms, self.prep_size.0, self.prep_size.1
+                "{:.0} fps  {:.1} ms  {}x{}  dropped {}",
+                self.fps, self.ms, self.prep_size.0, self.prep_size.1, self.dropped
             )),
             Line::styled(self.proto.name().to_string(), style_dim()),
         ];
@@ -908,14 +924,32 @@ impl App {
         write!(out, "\x1b7\x1b[{};{}H", lay.image.y + 1, lay.image.x + 1)?;
         match self.proto {
             Protocol::Kitty => {
-                out.write_all(&termimg::kitty_image(
-                    &rgb,
-                    w,
-                    h,
-                    lay.image.width,
-                    lay.image.height,
-                    KITTY_ID,
-                ))?;
+                // the same image id every frame: the terminal replaces the picture in place, nothing is deleted in between
+                let seq = if self.use_file {
+                    self.file_slot = (self.file_slot + 1) % 3;
+                    let path = termimg::temp_frame_path(std::process::id(), self.file_slot);
+                    std::fs::write(&path, &rgb)?;
+                    termimg::kitty_file(
+                        &path,
+                        w,
+                        h,
+                        lay.image.width,
+                        lay.image.height,
+                        KITTY_ID,
+                        -1,
+                    )
+                } else {
+                    termimg::kitty_image(
+                        &rgb,
+                        w,
+                        h,
+                        lay.image.width,
+                        lay.image.height,
+                        KITTY_ID,
+                        -1,
+                    )
+                };
+                out.write_all(&seq)?;
                 self.kitty_shown = true;
             }
             _ => out.write_all(&termimg::sixel(&rgb, w, h))?,
@@ -961,6 +995,14 @@ pub fn run(opts: TuiOptions) -> Result<()> {
         Some(p) => (p, None),
         None => termimg::detect(&|k| std::env::var(k).ok()),
     };
+    let local = termimg::is_local(&|k| std::env::var(k).ok());
+    let use_file = proto == Protocol::Kitty
+        && cfg!(unix)
+        && match opts.transfer {
+            Transfer::File => true,
+            Transfer::Direct => false,
+            Transfer::Auto => local,
+        };
     let mut app = App {
         watcher: FileWatcher::new(&opts.file),
         gpu,
@@ -987,6 +1029,9 @@ pub fn run(opts: TuiOptions) -> Result<()> {
         ms: 0.0,
         meter: (Instant::now(), 0),
         kitty_shown: false,
+        dropped: 0,
+        file_slot: 0,
+        use_file,
         opts,
     };
     // ratatui::init() enters raw mode and the alternate screen and installs a panic hook that restores them
@@ -1013,28 +1058,46 @@ fn restore_extras(proto: Protocol) -> std::io::Result<()> {
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
-    let interval = Duration::from_secs_f32(1.0 / app.opts.fps.clamp(1, 60) as f32);
+    let interval = Duration::from_secs_f64(1.0 / app.opts.fps.clamp(1, 60) as f64);
     let mut last = Instant::now();
     let mut last_check = Instant::now();
     let mut last_size = (0u16, 0u16);
+    // a fixed-step clock: frames start every `interval`, and a frame that cannot be kept up with is dropped (and counted), never
+    // answered with a burst of catch-up frames
     let mut next_frame = Instant::now();
     while !app.quit {
-        // input: wait for the next frame time, so the work of drawing is part of the interval, not added to it
-        let mut wait = next_frame.saturating_duration_since(Instant::now());
-        next_frame = Instant::now().max(next_frame) + interval;
-        while event::poll(wait)? {
+        // input arrives while waiting for the next frame time
+        loop {
+            let remaining = next_frame.saturating_duration_since(Instant::now());
+            if !event::poll(remaining)? {
+                break;
+            }
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m),
                 _ => {}
             }
-            wait = Duration::ZERO;
+            if remaining.is_zero() {
+                break;
+            }
+        }
+        let now = Instant::now();
+        let behind = now.saturating_duration_since(next_frame);
+        if behind >= interval {
+            app.dropped += (behind.as_secs_f64() / interval.as_secs_f64()) as u64;
+            next_frame = now;
+        }
+        next_frame += interval;
+        if app.quit {
+            break;
         }
         let area = terminal.size()?;
         let rect = Rect::new(0, 0, area.width, area.height);
         if (area.width, area.height) != last_size {
             last_size = (area.width, area.height);
             app.cell_px = cell_pixels();
+            // a resize repaints everything inside one synchronized update so it cannot flash
+            terminal.backend_mut().write_all(termimg::SYNC_BEGIN)?;
             terminal.clear()?;
         }
         let lay = layout(rect);
@@ -1047,7 +1110,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         }
         // the size to render at; a --text PNG fixes it
         let want = if app.opts.text == "sample" {
-            pixel_size(app.proto, lay.image, app.cell_px)
+            pixel_size(app.proto, lay.image, app.cell_px, app.use_file)
         } else {
             app.prep_size.max((16, 16))
         };
@@ -1094,13 +1157,21 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 app.ms = app.ms * 0.9 + t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
             }
         }
+        // one synchronized update per frame: the changed cells and the new picture appear together
+        terminal.backend_mut().write_all(termimg::SYNC_BEGIN)?;
         terminal.draw(|f| app.draw(f))?;
         app.emit_image(terminal.backend_mut(), &lay)?;
+        terminal.backend_mut().write_all(termimg::SYNC_END)?;
+        terminal.backend_mut().flush()?;
         app.meter.1 += 1;
         if app.meter.0.elapsed() >= Duration::from_millis(500) {
             app.fps = app.meter.1 as f32 / app.meter.0.elapsed().as_secs_f32();
             app.meter = (Instant::now(), 0);
         }
+    }
+    // the terminal deletes each frame file as it reads it; remove any it never got to
+    for slot in 0..3 {
+        let _ = std::fs::remove_file(termimg::temp_frame_path(std::process::id(), slot));
     }
     Ok(())
 }
@@ -1131,6 +1202,7 @@ mod tests {
             text: "sample".into(),
             origin: Origin::TopLeft,
             fps: 30,
+            transfer: Transfer::Direct,
         };
         App {
             watcher: FileWatcher::new(Path::new("/nonexistent")),
@@ -1158,6 +1230,9 @@ mod tests {
             ms: 1.2,
             meter: (Instant::now(), 0),
             kitty_shown: false,
+            dropped: 0,
+            file_slot: 0,
+            use_file: false,
             opts,
         }
     }
@@ -1169,7 +1244,7 @@ mod tests {
         // render a frame the way the loop does
         let lay = layout(Rect::new(0, 0, w, h));
         if lay.image.width > 0 && lay.image.height > 0 {
-            let size = pixel_size(app.proto, lay.image, app.cell_px);
+            let size = pixel_size(app.proto, lay.image, app.cell_px, app.use_file);
             app.rebuild(size);
             if let Some(p) = app.prepared.as_ref() {
                 p.draw_rgba8(&app.gpu, 3.0, 0.033, 1, &mut app.image)
@@ -1229,18 +1304,38 @@ mod tests {
     fn the_render_size_is_the_cells_for_half_blocks_and_capped_for_graphics() {
         let img = Rect::new(0, 0, 100, 30);
         assert_eq!(
-            pixel_size(Protocol::HalfBlocks, img, (8.0, 16.0)),
+            pixel_size(Protocol::HalfBlocks, img, (8.0, 16.0), false),
             (100 * SS, 60 * SS)
         );
-        let (w, h) = pixel_size(Protocol::Kitty, img, (8.0, 16.0));
-        assert!(w <= 960 && h <= 540 && w % 2 == 0 && h % 2 == 0, "{w}x{h}");
-        // aspect is kept: 800x480 fits
-        assert_eq!(pixel_size(Protocol::Kitty, img, (8.0, 16.0)), (800, 480));
-        let (w, h) = pixel_size(Protocol::Kitty, Rect::new(0, 0, 300, 100), (10.0, 20.0));
-        assert!(w <= 960 && h <= 540);
+        let (w, h) = pixel_size(Protocol::Kitty, img, (8.0, 16.0), false);
+        assert!(w <= 640 && h <= 360 && w % 2 == 0 && h % 2 == 0, "{w}x{h}");
+        // aspect is kept: 800x480 scales to fit 640x360
+        assert_eq!(
+            pixel_size(Protocol::Kitty, img, (8.0, 16.0), false),
+            (600, 360)
+        );
+        assert_eq!(
+            pixel_size(Protocol::Kitty, img, (8.0, 16.0), true),
+            (800, 480)
+        );
+        let (w, h) = pixel_size(
+            Protocol::Kitty,
+            Rect::new(0, 0, 300, 100),
+            (10.0, 20.0),
+            false,
+        );
+        assert!(w <= 640 && h <= 360);
         assert!((w as f32 / h as f32 - 1.5).abs() < 0.05, "aspect {w}x{h}");
-        assert!(pixel_size(Protocol::Sixel, img, (8.0, 16.0)).0 <= 640);
-        assert!(pixel_size(Protocol::HalfBlocks, Rect::new(0, 0, 0, 0), (8.0, 16.0)).0 >= 1);
+        assert!(pixel_size(Protocol::Sixel, img, (8.0, 16.0), false).0 <= 640);
+        assert!(
+            pixel_size(
+                Protocol::HalfBlocks,
+                Rect::new(0, 0, 0, 0),
+                (8.0, 16.0),
+                false
+            )
+            .0 >= 1
+        );
     }
 
     #[test]
@@ -1487,5 +1582,91 @@ mod tests {
             }
         }
         img.save(out).unwrap();
+    }
+
+    /// What one frame of the loop writes, in order (the same calls the event loop makes), for a kitty terminal.
+    fn one_frame(app: &mut App, w: u16, h: u16) -> Vec<u8> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let lay = layout(Rect::new(0, 0, w, h));
+        let size = pixel_size(app.proto, lay.image, app.cell_px, app.use_file);
+        app.rebuild(size);
+        let p = app.prepared.as_ref().unwrap();
+        p.draw_rgba8(&app.gpu, 1.0, 0.033, 1, &mut app.image)
+            .unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(termimg::SYNC_BEGIN);
+        app.emit_image(&mut out, &lay).unwrap();
+        out.extend_from_slice(termimg::SYNC_END);
+        out
+    }
+
+    #[test]
+    fn every_frame_replaces_the_same_image_in_place_inside_one_synchronized_update() {
+        let Some(g) = gpu() else { return };
+        let mut app = app_for(g, DEMO, Protocol::Kitty);
+        for use_file in [false, true] {
+            app.use_file = use_file;
+            let frames: Vec<String> = (0..4)
+                .map(|_| String::from_utf8_lossy(&one_frame(&mut app, 120, 36)).into_owned())
+                .collect();
+            for f in &frames {
+                assert!(
+                    f.starts_with("\x1b[?2026h"),
+                    "a frame opens a synchronized update"
+                );
+                assert!(
+                    f.ends_with("\x1b[?2026l"),
+                    "and closes it after the picture"
+                );
+                assert_eq!(f.matches("\x1b[?2026h").count(), 1);
+                assert_eq!(f.matches("\x1b_Ga=T,").count(), 1, "one picture per frame");
+                assert!(
+                    f.contains(&format!("i={KITTY_ID},")),
+                    "always the same image id"
+                );
+                assert!(
+                    !f.contains("\x1b_Ga=d"),
+                    "the image is never deleted between frames"
+                );
+                assert!(f.contains("z=-1"), "below the text");
+                assert!(
+                    f.contains(&format!(",p={},", termimg::PLACEMENT)),
+                    "a placement id, so the old placement is replaced in place"
+                );
+                assert!(
+                    f.contains("\x1b7") && f.contains("\x1b8"),
+                    "the cursor position is saved and restored around the picture"
+                );
+                assert!(f.find("\x1b_Ga=T").unwrap() < f.rfind("\x1b[?2026l").unwrap());
+                if use_file {
+                    assert!(
+                        f.len() < 400,
+                        "a file transfer is a few hundred bytes a frame, not a picture's worth of base64 ({} bytes)",
+                        f.len()
+                    );
+                    assert!(f.contains("t=t"));
+                } else {
+                    assert!(f.len() > 10_000, "direct transfer carries the pixels");
+                    assert!(f.contains("o=z"));
+                }
+            }
+        }
+        // the frame files rotate over a few names and hold the whole raw picture
+        let (w, h) = app.prep_size;
+        let path = termimg::temp_frame_path(std::process::id(), app.file_slot);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), (w * h * 3) as u64);
+        for slot in 0..3 {
+            let _ = std::fs::remove_file(termimg::temp_frame_path(std::process::id(), slot));
+        }
+    }
+
+    #[test]
+    fn the_panel_shows_the_dropped_frame_counter() {
+        let Some(g) = gpu() else { return };
+        let mut app = app_for(g, DEMO, Protocol::HalfBlocks);
+        app.dropped = 7;
+        let t = text_of(&render(&mut app, 120, 36));
+        assert!(t.contains("dropped 7"), "{t}");
     }
 }

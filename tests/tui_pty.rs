@@ -130,35 +130,60 @@ fn halfblocks_mode_runs_takes_keys_exits_zero_and_restores_the_terminal() {
 }
 
 #[test]
-fn kitty_mode_sends_the_image_and_deletes_it_on_exit() {
+fn kitty_mode_replaces_one_image_in_place_every_frame_inside_synchronized_updates() {
     if !have_gpu() {
         eprintln!("SKIPPED: no GPU adapter; nothing was verified by this test");
         return;
     }
-    let (code, out) = run_in_pty(
-        &["preview", &example("vignette.glsl"), "--protocol", "kitty"],
-        30,
-        100,
-        Duration::from_millis(1500),
-        b"q",
-    );
-    assert_eq!(code, 0, "{out:?}");
-    assert!(
-        out.contains("\x1b_Ga=T,f=24,o=z,"),
-        "a kitty image is transmitted"
-    );
-    assert!(
-        out.contains("i=4242"),
-        "with a fixed id so each frame replaces the last in place"
-    );
-    let delete = out
-        .rfind("\x1b_Ga=d,d=I,i=4242")
-        .expect("the image is deleted on exit");
-    let leave = out.rfind("\x1b[?1049l").expect("alternate screen left");
-    assert!(
-        delete < leave,
-        "the image is removed before the screen is handed back"
-    );
+    for (transfer, small) in [("file", true), ("direct", false)] {
+        let (code, out) = run_in_pty(
+            &[
+                "preview",
+                &example("vignette.glsl"),
+                "--protocol",
+                "kitty",
+                "--kitty-transfer",
+                transfer,
+            ],
+            30,
+            100,
+            Duration::from_millis(1500),
+            b"q",
+        );
+        assert_eq!(code, 0, "{transfer}: {out:?}");
+        let images = out.matches("\x1b_Ga=T,").count();
+        let begins = out.matches("\x1b[?2026h").count();
+        let ends = out.matches("\x1b[?2026l").count();
+        assert!(images >= 10, "{transfer}: only {images} frames in 1.5 s");
+        assert!(
+            begins >= images && ends >= images - 1,
+            "{transfer}: every frame sits in a synchronized update ({begins} begins, {ends} ends, {images} images)"
+        );
+        assert!(
+            out.matches("i=4242,p=1,").count() == images,
+            "{transfer}: one image id and one placement id for every frame"
+        );
+        assert!(out.contains("z=-1"));
+        // nothing is deleted between frames: the only delete is the one on exit, before the screen is handed back
+        assert_eq!(out.matches("\x1b_Ga=d").count(), 1, "{transfer}");
+        let delete = out
+            .rfind("\x1b_Ga=d,d=I,i=4242")
+            .expect("the image is deleted on exit");
+        assert!(delete < out.rfind("\x1b[?1049l").unwrap());
+        assert!(out.rfind("\x1b_Ga=T,").unwrap() < delete);
+        let per_frame = out.len() / images;
+        if small {
+            assert!(
+                out.contains("t=t") && per_frame < 20_000,
+                "file transfer: {per_frame} bytes a frame"
+            );
+        } else {
+            assert!(
+                out.contains("o=z") && per_frame > 20_000,
+                "direct transfer carries the pixels: {per_frame} bytes a frame"
+            );
+        }
+    }
 }
 
 #[test]

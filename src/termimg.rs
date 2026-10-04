@@ -95,11 +95,15 @@ pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
 ///
 /// Reusing the same id replaces the picture in place (no flicker); `C=1` leaves the cursor alone; `q=2` silences replies;
 /// the pixels are zlib-compressed (`o=z`) because a smooth shader compresses well and the terminal link is the bottleneck.
-pub fn kitty_image(rgb: &[u8], w: u32, h: u32, cols: u16, rows: u16, id: u32) -> Vec<u8> {
+/// The placement id every frame uses. Placing the same image id with the same placement id REPLACES the old placement in place;
+/// without it each frame makes a new placement (measured in Ghostty 1.3.1: about 1 frame in 8 stalls for 2+ frames, vs none with it).
+pub const PLACEMENT: u32 = 1;
+
+pub fn kitty_image(rgb: &[u8], w: u32, h: u32, cols: u16, rows: u16, id: u32, z: i32) -> Vec<u8> {
     use flate2::{Compression, write::ZlibEncoder};
-    let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
-    z.write_all(rgb).expect("writing to a Vec cannot fail");
-    let payload = base64(&z.finish().expect("finishing a Vec cannot fail"));
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(rgb).expect("writing to a Vec cannot fail");
+    let payload = base64(&enc.finish().expect("finishing a Vec cannot fail"));
     let mut out = Vec::new();
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(4096).collect();
     for (i, chunk) in chunks.iter().enumerate() {
@@ -107,7 +111,7 @@ pub fn kitty_image(rgb: &[u8], w: u32, h: u32, cols: u16, rows: u16, id: u32) ->
         if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,f=24,o=z,s={w},v={h},i={id},c={cols},r={rows},C=1,q=2,m={more};"
+                "\x1b_Ga=T,f=24,o=z,s={w},v={h},i={id},p={PLACEMENT},c={cols},r={rows},z={z},C=1,q=2,m={more};"
             )
             .unwrap();
         } else {
@@ -117,6 +121,39 @@ pub fn kitty_image(rgb: &[u8], w: u32, h: u32, cols: u16, rows: u16, id: u32) ->
         out.extend_from_slice(b"\x1b\\");
     }
     out
+}
+
+/// Place image `id` from a raw RGB file the terminal reads and deletes itself (`t=t`): the escape sequence is ~100 bytes instead of
+/// hundreds of kilobytes of base64 per frame, so the terminal's parser never stalls on the picture. Only for a terminal on this
+/// machine. The path must be in a temp directory and contain `tty-graphics-protocol` (the protocol's rule).
+pub fn kitty_file(path: &str, w: u32, h: u32, cols: u16, rows: u16, id: u32, z: i32) -> Vec<u8> {
+    format!(
+        "\x1b_Ga=T,f=24,t=t,s={w},v={h},i={id},p={PLACEMENT},c={cols},r={rows},z={z},C=1,q=2;{}\x1b\\",
+        base64(path.as_bytes())
+    )
+    .into_bytes()
+}
+
+/// Synchronized update (DEC mode 2026): the terminal holds everything between these and shows it as one frame, so the cells and the
+/// picture change together. Also hides the cursor so a blinking one cannot flash over the picture.
+pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h\x1b[?25l";
+pub const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+/// Where frame `slot` is written for `t=t` transfer (a few rotating files; the terminal deletes each after reading it).
+pub fn temp_frame_path(pid: u32, slot: usize) -> String {
+    // the system temp directory ($TMPDIR): Ghostty only accepts a temporary file inside its own idea of the temp dir, which on
+    // macOS is NOT /tmp (measured: "temporary file not in temp dir" for /tmp, OK for $TMPDIR)
+    std::env::temp_dir()
+        .join(format!("tty-graphics-protocol-shaderlab-{pid}-{slot}.rgb"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether the terminal is on this machine (a file path means nothing over ssh or mosh).
+pub fn is_local(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    !["SSH_CONNECTION", "SSH_TTY", "MOSH_CONNECTION"]
+        .iter()
+        .any(|k| get(k).is_some_and(|v| !v.is_empty()))
 }
 
 /// Remove image `id` (and free its data).
@@ -315,7 +352,7 @@ mod tests {
                 (seed >> 24) as u8
             })
             .collect();
-        let out = String::from_utf8(kitty_image(&rgb, w, h, 20, 10, 7)).unwrap();
+        let out = String::from_utf8(kitty_image(&rgb, w, h, 20, 10, 7, -1)).unwrap();
         let seqs: Vec<&str> = out.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert!(
             seqs.len() >= 2,
@@ -324,9 +361,9 @@ mod tests {
         );
         let first = seqs[0];
         assert!(
-            first.starts_with("\x1b_Ga=T,f=24,o=z,s=64,v=48,i=7,c=20,r=10,C=1,q=2,m=1;"),
+            first.starts_with("\x1b_Ga=T,f=24,o=z,s=64,v=48,i=7,p=1,c=20,r=10,z=-1,C=1,q=2,m=1;"),
             "{}",
-            &first[..60]
+            &first[..70]
         );
         let mut payload = String::new();
         for (i, s) in seqs.iter().enumerate() {
@@ -357,6 +394,27 @@ mod tests {
             .read_to_end(&mut back)
             .unwrap();
         assert_eq!(back, rgb);
+    }
+
+    #[test]
+    fn a_file_transfer_is_tiny_and_names_a_protocol_temp_file() {
+        let path = temp_frame_path(4242, 1);
+        assert!(
+            path.starts_with(std::env::temp_dir().to_str().unwrap())
+                && path.contains("tty-graphics-protocol")
+        );
+        let seq = String::from_utf8(kitty_file(&path, 640, 360, 80, 30, 7, -1)).unwrap();
+        assert!(
+            seq.starts_with("\x1b_Ga=T,f=24,t=t,s=640,v=360,i=7,p=1,c=80,r=30,z=-1,C=1,q=2;"),
+            "{seq}"
+        );
+        assert!(seq.len() < 200, "a path, not pixels: {} bytes", seq.len());
+        let b64 = seq.split_once(';').unwrap().1.trim_end_matches("\x1b\\");
+        assert_eq!(b64, base64(path.as_bytes()));
+        assert!(SYNC_BEGIN.starts_with(b"\x1b[?2026h") && SYNC_END == b"\x1b[?2026l");
+        let local = |k: &str| (k == "TERM").then(|| "xterm".to_string());
+        let remote = |k: &str| (k == "SSH_CONNECTION").then(|| "1.2.3.4 5 6.7.8.9 22".to_string());
+        assert!(is_local(&local) && !is_local(&remote));
     }
 
     #[test]

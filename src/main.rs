@@ -134,9 +134,12 @@ enum Cmd {
         /// How the picture reaches the terminal (default: detected)
         #[arg(long, value_enum, default_value_t = ProtocolArg::Auto)]
         protocol: ProtocolArg,
-        /// Frames per second in the terminal (capped at 60)
+        /// Frames per second in the terminal: 30 by default; 15, 24 or 60 are good alternatives (max 60)
         #[arg(long, default_value_t = 30)]
         fps: u32,
+        /// How a kitty picture travels: auto (a temp file when the terminal is on this machine, else base64), file or direct
+        #[arg(long, value_enum, default_value_t = TransferArg::Auto)]
+        kitty_transfer: TransferArg,
         /// Open a separate window instead of drawing in the terminal
         #[arg(long)]
         window: bool,
@@ -188,6 +191,24 @@ impl From<ProtocolArg> for Option<shaderlab::termimg::Protocol> {
             ProtocolArg::Kitty => Some(Protocol::Kitty),
             ProtocolArg::Sixel => Some(Protocol::Sixel),
             ProtocolArg::Halfblocks => Some(Protocol::HalfBlocks),
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TransferArg {
+    Auto,
+    File,
+    Direct,
+}
+
+#[cfg(feature = "tui")]
+impl From<TransferArg> for shaderlab::tui::Transfer {
+    fn from(t: TransferArg) -> Self {
+        match t {
+            TransferArg::Auto => Self::Auto,
+            TransferArg::File => Self::File,
+            TransferArg::Direct => Self::Direct,
         }
     }
 }
@@ -382,6 +403,7 @@ fn run() -> Result<ExitCode> {
             origin,
             protocol,
             fps,
+            kitty_transfer,
             window,
         } => {
             if window {
@@ -413,6 +435,7 @@ fn run() -> Result<ExitCode> {
                     preset,
                     sets,
                     protocol: protocol.into(),
+                    transfer: kitty_transfer.into(),
                     text,
                     origin: origin.into(),
                     fps,

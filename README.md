@@ -81,9 +81,11 @@ last good shader keeps running.
 
 | protocol | when | notes |
 | --- | --- | --- |
-| `kitty` | Ghostty, kitty, WezTerm | the kitty graphics protocol: the frame is rendered at the pane's pixel size (capped at 960x540), zlib-compressed and sent with a fixed image id, so each frame replaces the last in place without flicker. The image is deleted on exit. |
+| `kitty` | Ghostty, kitty, WezTerm | the kitty graphics protocol: the frame is rendered at the pane's pixel size (capped at 960x540) and written to a temp file the terminal reads and deletes (`--kitty-transfer file`, the default when the terminal is on this machine; over ssh it falls back to zlib-compressed base64, capped at 640x360). Every frame uses the same image id AND placement id so the terminal replaces the picture in place, and each frame is one synchronized update (DEC 2026), so the cells and the picture change together. Nothing is deleted between frames; the image is deleted on exit. |
 | `sixel` | foot, mlterm, iTerm2, or `TERM` naming sixel | 216-color cube, capped at 640x360. |
 | `halfblocks` | everything else | truecolor `▀` characters (two pixels per cell, rendered 4x finer and averaged down). Works anywhere; text in the sample frame is blurry at cell resolution. |
+
+The loop runs on a fixed 30 fps clock (`--fps`: 15, 24 and 60 also work). A frame it cannot keep up with is dropped, never answered with a burst of catch-up frames, and the panel shows the dropped-frame count.
 
 Inside **tmux** the graphics protocols need passthrough (`set -g allow-passthrough on`), so tmux gets half-blocks unless you force
 `--protocol kitty`. Detection is by environment variables, not by asking the terminal.
