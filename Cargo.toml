@@ -1,0 +1,45 @@
+[package]
+name = "shaderlab"
+version = "0.1.0"
+edition = "2024"
+description = "Render, preview and check Ghostty/Shadertoy-style terminal shaders headlessly: PNG frames, contact sheets, and objective checks (compiles, text preserved, animates, fast enough)"
+license = "MIT"
+repository = "https://github.com/evanspn/shader-lab"
+readme = "README.md"
+keywords = ["shader", "glsl", "ghostty", "terminal", "wgpu"]
+categories = ["command-line-utilities", "graphics", "development-tools"]
+rust-version = "1.88"
+
+[lib]
+name = "shaderlab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shaderlab"
+path = "src/main.rs"
+required-features = ["render"]
+
+[features]
+default = ["render"]
+# The GPU renderer, the checker and the CLI. Without it only the parameter annotation library is built.
+render = ["dep:wgpu", "dep:pollster", "dep:image", "dep:clap", "dep:anyhow"]
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+pollster = { version = "1", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+wgpu = { version = "30", default-features = false, features = ["glsl", "wgsl"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan", "gles"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["dx12", "vulkan"], optional = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3"

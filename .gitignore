@@ -1,0 +1,9 @@
+/target
+# renders are output, never source: keep every image out of the repo
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.ppm
