@@ -178,9 +178,22 @@ pub struct WindowGpu {
     pub instance: wgpu::Instance,
 }
 
+/// wgpu panics when this build has no usable backend (for example a Linux CI runner with only the Metal backend compiled in).
+/// Report that as "no adapter" so callers can skip cleanly instead of crashing.
+fn new_instance() -> Result<wgpu::Instance, GpuError> {
+    std::panic::catch_unwind(|| {
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle())
+    })
+    .map_err(|_| {
+        GpuError::NoAdapter(
+            "no graphics backend is available in this build or on this machine".into(),
+        )
+    })
+}
+
 impl Gpu {
     pub fn new() -> Result<Gpu, GpuError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = new_instance()?;
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .map_err(|e| GpuError::NoAdapter(e.to_string()))?;
@@ -200,7 +213,7 @@ impl Gpu {
     pub fn for_window<'w>(
         target: impl Into<wgpu::SurfaceTarget<'w>>,
     ) -> Result<(WindowGpu, wgpu::Surface<'w>), GpuError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = new_instance()?;
         let surface = instance
             .create_surface(target)
             .map_err(|e| GpuError::NoAdapter(format!("could not create a window surface: {e}")))?;
