@@ -341,7 +341,10 @@ fn the_browser_opens_with_no_arguments_takes_keys_quits_zero_and_restores_the_te
     for t in ["Shaders", "Renders", "Videos", "Sheets"] {
         assert!(r.out.contains(t), "{t} not on screen");
     }
-    assert!(r.out.contains("vignette"), "the built-in shaders are listed");
+    assert!(
+        r.out.contains("vignette"),
+        "the built-in shaders are listed"
+    );
     assert!(
         r.out.contains("\x1b[?1049l") && r.out.contains("\x1b[?25h"),
         "the terminal is restored"
