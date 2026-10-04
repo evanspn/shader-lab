@@ -207,7 +207,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
         origin: OriginArg,
     },
-    /// Browse your shaders, renders, videos and sheets in the terminal (the default when you run `shaderlab` alone): a list with a live
+    /// Browse your shaders, renders, videos and sheets in the terminal (the default when you run `shaderlab` alone): files with a live
     /// preview. Enter opens a shader's full preview or a picture / video full size; r renders a still, v records a video, e edits,
     /// o reveals in Finder, c copies the path, d moves to the Trash (never deletes), i imports, / filters, ? is the full help.
     Browse {
