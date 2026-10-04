@@ -18,5 +18,9 @@ pub mod gpu;
 pub mod preview;
 #[cfg(feature = "render")]
 pub mod sheet;
+#[cfg(feature = "tui")]
+pub mod termimg;
+#[cfg(feature = "tui")]
+pub mod tui;
 #[cfg(feature = "render")]
 pub mod video;

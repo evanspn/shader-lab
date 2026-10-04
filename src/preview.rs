@@ -19,6 +19,10 @@ pub enum PKey {
     Up,
     Down,
     Escape,
+    Enter,
+    /// Shift + left / right: a bigger step
+    BigLeft,
+    BigRight,
 }
 
 /// What the window should do after a key.
@@ -107,6 +111,47 @@ impl PreviewState {
         self.sets.push(format!("{name}={value}"));
     }
 
+    /// Set parameter `idx` to `value` (a number or `#rrggbb`); a value the schema rejects changes nothing.
+    pub fn set_value(&mut self, idx: usize, value: &str) -> bool {
+        let Some(p) = self.schema.params.get(idx).cloned() else {
+            return false;
+        };
+        let before = self.sets.clone();
+        self.set_param(&p.name, value.to_string());
+        if self.values().is_err() {
+            self.sets = before;
+            return false;
+        }
+        true
+    }
+
+    /// Set a number parameter from a position along its bar, 0.0..=1.0.
+    pub fn set_fraction(&mut self, idx: usize, fraction: f64) -> bool {
+        let Some(Kind::Float { min, max }) = self.schema.params.get(idx).map(|p| p.kind.clone())
+        else {
+            return false;
+        };
+        let v = min + (max - min) * fraction.clamp(0.0, 1.0);
+        // two decimals of the range's own scale is plenty for a slider
+        let step = ((max - min) / 200.0).max(1e-4);
+        let v = (v / step).round() * step;
+        self.set_value(idx, &params::format_number(v.clamp(min, max)))
+    }
+
+    pub fn pick_preset(&mut self, preset: Option<usize>) {
+        if preset.is_none_or(|i| i < self.schema.presets.len()) {
+            self.preset = preset;
+            self.sets.clear();
+        }
+    }
+
+    /// The effective value of every parameter, in order.
+    pub fn effective(&self) -> Vec<String> {
+        self.values()
+            .map(|v| params::resolve(&self.schema, &v))
+            .unwrap_or_default()
+    }
+
     fn adjust(&mut self, dir: f32) -> Action {
         let Some(p) = self.schema.params.get(self.param_sel).cloned() else {
             return Action::Say("this shader has no parameters".into());
@@ -165,15 +210,19 @@ impl PreviewState {
                     "terminal frame off (black)".into()
                 })
             }
-            PKey::Char('p' | 'P') => {
+            PKey::Char(c @ ('p' | 'P')) => {
                 if self.schema.presets.is_empty() {
                     return Action::Say("this shader has no presets".into());
                 }
-                self.preset = match self.preset {
-                    None => Some(0),
-                    Some(i) if i + 1 < self.schema.presets.len() => Some(i + 1),
-                    Some(_) => None,
+                let n = self.schema.presets.len();
+                // p goes forward through the presets (defaults, then each), P goes back
+                let pos = self.preset.map_or(0, |i| i + 1);
+                let pos = if c == 'p' {
+                    (pos + 1) % (n + 1)
+                } else {
+                    (pos + n) % (n + 1)
                 };
+                self.preset = pos.checked_sub(1);
                 self.sets.clear();
                 Action::Rebuild(format!(
                     "preset: {}",
@@ -199,6 +248,28 @@ impl PreviewState {
             }
             PKey::Left => self.adjust(-1.0),
             PKey::Right => self.adjust(1.0),
+            PKey::BigLeft => self.adjust(-5.0),
+            PKey::BigRight => self.adjust(5.0),
+            PKey::Char('o' | 'O') => {
+                let Some(i) = self
+                    .schema
+                    .params
+                    .iter()
+                    .position(|p| p.name == params::OPACITY)
+                else {
+                    return Action::Say("this shader has no opacity parameter".into());
+                };
+                if self.sets.iter().any(|s| s == "opacity=0") {
+                    self.sets.retain(|s| s != "opacity=0");
+                    Action::Rebuild(format!(
+                        "opacity back on ({})",
+                        self.effective().get(i).cloned().unwrap_or_default()
+                    ))
+                } else {
+                    self.set_param(params::OPACITY, "0".into());
+                    Action::Rebuild("opacity 0: the effect is hidden (O brings it back)".into())
+                }
+            }
             PKey::Char('s' | 'S') => Action::SavePng,
             PKey::Char('v' | 'V') => Action::Record,
             PKey::Char('q' | 'Q') | PKey::Escape => Action::Quit,
@@ -207,7 +278,7 @@ impl PreviewState {
     }
 }
 
-fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
@@ -224,7 +295,7 @@ fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (h, if max == 0.0 { 0.0 } else { d / max }, max)
 }
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
     let m = v - c;
@@ -986,6 +1057,16 @@ mod tests {
         assert_eq!(s.preset_name(), Some("cool"));
         s.key(PKey::Char('p'));
         assert_eq!(s.preset_name(), None);
+        // P goes backwards
+        s.key(PKey::Char('P'));
+        assert_eq!(s.preset_name(), Some("cool"));
+        s.key(PKey::Char('P'));
+        assert_eq!(s.preset_name(), Some("warm"));
+        s.key(PKey::Char('P'));
+        assert_eq!(s.preset_name(), None);
+        s.key(PKey::Char('p'));
+        s.key(PKey::Char('p'));
+        s.key(PKey::Char('p'));
         // a manual change is dropped when the preset changes
         s.sets.push("speed=3".into());
         s.key(PKey::Char('p'));
@@ -1046,6 +1127,31 @@ mod tests {
             (sat0 - sat1).abs() < 0.02 && (val0 - val1).abs() < 0.02,
             "only the hue moves"
         );
+    }
+
+    #[test]
+    fn big_steps_o_toggles_opacity_and_mouse_setters_validate() {
+        let mut s = state();
+        s.key(PKey::Char('3')); // speed 0..3, a step is 0.15
+        s.key(PKey::BigRight);
+        assert_eq!(s.effective()[2], "1.75", "five steps");
+        // O hides the effect and brings it back
+        assert!(matches!(s.key(PKey::Char('o')), Action::Rebuild(m) if m.contains("hidden")));
+        assert_eq!(s.effective()[0], "0");
+        assert!(matches!(s.key(PKey::Char('O')), Action::Rebuild(m) if m.contains("back on")));
+        assert_eq!(s.effective()[0], "1");
+        // a bar click sets a fraction of the range; a bad value changes nothing
+        assert!(s.set_fraction(2, 0.5));
+        assert_eq!(s.effective()[2], "1.5");
+        assert!(s.set_fraction(2, 5.0), "clamped to the end");
+        assert_eq!(s.effective()[2], "3");
+        assert!(!s.set_fraction(1, 0.5), "a color has no bar");
+        assert!(!s.set_value(1, "nonsense"));
+        assert!(s.set_value(1, "#112233"));
+        assert_eq!(s.effective()[1], "#112233");
+        s.pick_preset(Some(1));
+        assert_eq!(s.preset_name(), Some("cool"));
+        assert!(s.sets.is_empty());
     }
 
     #[test]

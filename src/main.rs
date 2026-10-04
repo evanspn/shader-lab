@@ -115,21 +115,31 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// A live window: the shader running in real time over the terminal frame, with hot reload and keys
-    /// (space pause, [ ] speed, R reset, T terminal on/off, P presets, 1-9 or arrows to pick and change a parameter,
-    /// S save a PNG, V record 5 s, Q quit)
+    /// Live preview INSIDE the terminal (kitty graphics, sixel or half-blocks), with hot reload; `--window` opens a separate window.
+    /// Keys: space pause, [ ] speed, R reset, T terminal on/off, P/p presets, O opacity, arrows pick/change (shift: more),
+    /// Enter color picker, S save PNG, V record 5 s, Q quit. The mouse sets bars, presets and the picker.
     Preview {
         file: PathBuf,
         #[arg(long)]
         preset: Option<String>,
         #[arg(long = "set")]
         sets: Vec<String>,
+        /// Window size (with --window)
         #[arg(long, default_value = "1280x720")]
         size: String,
         #[arg(long, default_value = "sample")]
         text: String,
         #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
         origin: OriginArg,
+        /// How the picture reaches the terminal (default: detected)
+        #[arg(long, value_enum, default_value_t = ProtocolArg::Auto)]
+        protocol: ProtocolArg,
+        /// Frames per second in the terminal (capped at 60)
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Open a separate window instead of drawing in the terminal
+        #[arg(long)]
+        window: bool,
     },
     /// Objective checks (compiles, text preserved, animates, declared motion, speed); exits non-zero on a failure
     Check {
@@ -159,6 +169,27 @@ enum Cmd {
         #[arg(long)]
         cpu_only: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProtocolArg {
+    Auto,
+    Kitty,
+    Sixel,
+    Halfblocks,
+}
+
+#[cfg(feature = "tui")]
+impl From<ProtocolArg> for Option<shaderlab::termimg::Protocol> {
+    fn from(p: ProtocolArg) -> Self {
+        use shaderlab::termimg::Protocol;
+        match p {
+            ProtocolArg::Auto => None,
+            ProtocolArg::Kitty => Some(Protocol::Kitty),
+            ProtocolArg::Sixel => Some(Protocol::Sixel),
+            ProtocolArg::Halfblocks => Some(Protocol::HalfBlocks),
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -349,25 +380,51 @@ fn run() -> Result<ExitCode> {
             size,
             text,
             origin,
+            protocol,
+            fps,
+            window,
         } => {
-            #[cfg(feature = "preview")]
+            if window {
+                #[cfg(feature = "preview")]
+                {
+                    shaderlab::preview::run(shaderlab::preview::PreviewOptions {
+                        file,
+                        preset,
+                        sets,
+                        size: parse_size(&size)?,
+                        text,
+                        origin: origin.into(),
+                    })?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+                #[cfg(not(feature = "preview"))]
+                {
+                    let _ = (&file, &preset, &sets, &size, &text, &origin);
+                    bail!(
+                        "this build has no separate preview window: reinstall with `--features preview`"
+                    )
+                }
+            }
+            #[cfg(feature = "tui")]
             {
-                shaderlab::preview::run(shaderlab::preview::PreviewOptions {
+                let _ = size;
+                shaderlab::tui::run(shaderlab::tui::TuiOptions {
                     file,
                     preset,
                     sets,
-                    size: parse_size(&size)?,
+                    protocol: protocol.into(),
                     text,
                     origin: origin.into(),
+                    fps,
                 })?;
                 Ok(ExitCode::SUCCESS)
             }
-            #[cfg(not(feature = "preview"))]
+            #[cfg(not(feature = "tui"))]
             {
-                let _ = (file, preset, sets, size, text, origin);
-                bail!(
-                    "this build has no live preview: reinstall with `cargo install --git https://github.com/evanspn/shader-lab --features preview`"
-                )
+                let _ = (
+                    &file, &preset, &sets, &size, &text, &origin, &protocol, &fps,
+                );
+                bail!("this build has no terminal preview: reinstall with the default features")
             }
         }
         Cmd::ContactSheet {

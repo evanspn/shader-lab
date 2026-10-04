@@ -10,7 +10,7 @@ and moves the way it says it does.
 shaderlab render FILE         one frame to a PNG
 shaderlab contact-sheet FILE  a grid: one row per preset, one column per time
 shaderlab video FILE          many frames in one GPU session: mp4 (ffmpeg), GIF or PNG frames
-shaderlab preview FILE        a live window with hot reload and keys
+shaderlab preview FILE        live in the terminal (Ratatui; kitty graphics / sixel / half-blocks), with hot reload; --window for a window
 shaderlab check FILE...       objective checks; exit code 1 if any fails
 ```
 
@@ -65,14 +65,28 @@ shaderlab video my.glsl --preset storm --size 1290x2796 --text blank-frame.png -
 SHADERLAB_NO_FFMPEG=1 shaderlab video my.glsl --out quick.gif      # force the GIF path
 ```
 
-## Live preview
+## Live preview (in the terminal)
 
 ```
-shaderlab preview FILE [--preset X] [--set k=v]... [--size 1280x720] [--text sample|PATH.png] [--origin ...]
+shaderlab preview FILE [--preset X] [--set k=v]... [--protocol auto|kitty|sixel|halfblocks] [--fps 30] [--text sample|PATH.png] [--origin ...]
+shaderlab preview FILE --window     # a separate window instead (winit)
 ```
 
-A window shows the shader running in real time over the synthetic terminal frame. Save the file in your editor and it reloads; a
-compile error shows in the window title and in the terminal while the last good shader keeps running.
+`preview` is a [Ratatui](https://ratatui.rs) UI inside your terminal: the shader running on the GPU over the synthetic terminal
+frame takes most of the screen, and a side panel shows the name, preset, time, fps/ms, every parameter (colors with a swatch and hex,
+numbers with a bar) and the presets. Save the shader in your editor and it reloads; a compile error appears in the panel while the
+last good shader keeps running.
+
+**How the picture reaches the terminal** (`--protocol auto` detects from the environment):
+
+| protocol | when | notes |
+| --- | --- | --- |
+| `kitty` | Ghostty, kitty, WezTerm | the kitty graphics protocol: the frame is rendered at the pane's pixel size (capped at 960x540), zlib-compressed and sent with a fixed image id, so each frame replaces the last in place without flicker. The image is deleted on exit. |
+| `sixel` | foot, mlterm, iTerm2, or `TERM` naming sixel | 216-color cube, capped at 640x360. |
+| `halfblocks` | everything else | truecolor `▀` characters (two pixels per cell, rendered 4x finer and averaged down). Works anywhere; text in the sample frame is blurry at cell resolution. |
+
+Inside **tmux** the graphics protocols need passthrough (`set -g allow-passthrough on`), so tmux gets half-blocks unless you force
+`--protocol kitty`. Detection is by environment variables, not by asking the terminal.
 
 | key | does |
 | --- | --- |
@@ -80,15 +94,18 @@ compile error shows in the window title and in the terminal while the last good 
 | `[` `]` | slower / faster |
 | `R` | reset time to 0 |
 | `T` | terminal frame / plain background |
-| `P` | cycle the presets (and back to the defaults) |
-| `1`-`9`, up/down | pick a parameter (prints its name and value) |
-| left/right | change the picked parameter (numbers by a 20th of their range, colours by 15 degrees of hue) |
+| `p` / `P` | next / previous preset (and the defaults) |
+| `O` | hide / show the effect (sets `opacity` to 0 and back) |
+| up / down, `1`-`9` | pick a parameter |
+| left / right (shift = bigger) | change it: numbers by a 20th of their range, colors by 15 degrees of hue |
+| Enter | on a color: open the picker (hue / saturation / brightness bars; left/right or click and drag; Enter accepts, Esc cancels; the shader updates live) |
 | `S` | save a PNG (`NAME-preview-N.png`) |
 | `V` | record 5 seconds (mp4 with ffmpeg, else GIF) |
-| `Q` / Esc | quit |
+| `Q` / Ctrl-C | quit |
 
-The title shows the preset, time, speed and frames per second. With no display or GPU it exits with a clear error. The preview is
-on by default; to build without the window libraries use `cargo install --git https://github.com/evanspn/shader-lab --no-default-features --features render`.
+The mouse works too: click or drag a number's bar, click a color's swatch to open the picker, click a preset.
+The terminal is restored (alternate screen, mouse, cursor, kitty image) on quit, Ctrl-C and panic. With no GPU it exits with a
+clear error. Build without the terminal UI or the window with `--no-default-features --features render`.
 
 ## Commands
 

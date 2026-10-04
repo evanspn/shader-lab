@@ -20,9 +20,11 @@ path = "src/main.rs"
 required-features = ["render"]
 
 [features]
-default = ["render", "preview"]
+default = ["render", "tui", "preview"]
 # The GPU renderer, the checker and the CLI. Without it only the parameter annotation library is built.
 render = ["dep:wgpu", "dep:pollster", "dep:image", "dep:clap", "dep:anyhow", "dep:gif"]
+# The terminal UI of `shaderlab preview` (Ratatui; kitty graphics, sixel or half-block characters).
+tui = ["render", "dep:ratatui", "dep:flate2"]
 # A live window (winit) that runs the shader in real time with hot reload: `shaderlab preview`.
 preview = ["render", "dep:winit"]
 
@@ -34,6 +36,8 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 wgpu = { version = "30", default-features = false, features = ["glsl", "wgsl"], optional = true }
 gif = { version = "0.13", optional = true }
 winit = { version = "0.30.13", optional = true }
+ratatui = { version = "0.30.2", optional = true }
+flate2 = { version = "1.1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }
@@ -47,3 +51,4 @@ wgpu = { version = "30", default-features = false, features = ["dx12", "vulkan"]
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
+portable-pty = "0.9"
