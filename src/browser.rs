@@ -1285,6 +1285,7 @@ impl App {
                     out: out.clone(),
                     loop_seamless: false,
                     ffmpeg,
+                    threads: video::DEFAULT_THREADS,
                 },
             )
             .map_err(|e| format!("{e:#}"))?;

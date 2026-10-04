@@ -1,9 +1,13 @@
 {
   "machine": "Apple M3 Max / macOS 26.5.2",
   "entries": {
-    "claims-to-animate|default|1920x1080": {"p50_ms": 0.484, "p95_ms": 0.746},
-    "rain-down|default|1920x1080": {"p50_ms": 0.483, "p95_ms": 1.181},
-    "shadertoy-glow|default|1920x1080": {"p50_ms": 0.478, "p95_ms": 0.902},
-    "vignette|default|1920x1080": {"p50_ms": 0.483, "p95_ms": 0.608}
+    "claims-to-animate|default|1920x1080": {"p50_ms": 0.148, "p95_ms": 0.246, "ref_ms": 0.621},
+    "claims-to-animate|default|2560x1440": {"p50_ms": 0.232, "p95_ms": 0.338, "ref_ms": 1.359},
+    "rain-down|default|1920x1080": {"p50_ms": 0.158, "p95_ms": 0.249, "ref_ms": 0.640},
+    "rain-down|default|2560x1440": {"p50_ms": 0.245, "p95_ms": 0.332, "ref_ms": 1.236},
+    "shadertoy-glow|default|1920x1080": {"p50_ms": 0.148, "p95_ms": 0.252, "ref_ms": 0.631},
+    "shadertoy-glow|default|2560x1440": {"p50_ms": 0.226, "p95_ms": 0.363, "ref_ms": 1.290},
+    "vignette|default|1920x1080": {"p50_ms": 0.198, "p95_ms": 0.306, "ref_ms": 0.626},
+    "vignette|default|2560x1440": {"p50_ms": 0.253, "p95_ms": 0.301, "ref_ms": 1.223}
   }
 }

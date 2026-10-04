@@ -444,6 +444,7 @@ impl App {
                 out,
                 loop_seamless: false,
                 ffmpeg,
+                threads: video::DEFAULT_THREADS,
             },
         );
         self.message = match r {

@@ -113,6 +113,9 @@ enum Cmd {
         /// Cross-fade the last second into the first so the clip loops without a jump
         #[arg(long)]
         loop_seamless: bool,
+        /// Threads the mp4 encoder may use (it runs niced; default 2 so a long render does not pin the whole machine)
+        #[arg(long, default_value_t = 2)]
+        threads: u32,
         /// Output file (default ./NAME.mp4 or .gif); for --format frames, a folder
         #[arg(long)]
         out: Option<PathBuf>,
@@ -206,6 +209,9 @@ enum Cmd {
         baseline: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = OriginArg::TopLeft)]
         origin: OriginArg,
+        /// Print every check with its numbers, not only the table and the failures
+        #[arg(long)]
+        verbose: bool,
     },
     /// Browse your shaders, renders, videos and sheets in the terminal (the default when you run `shaderlab` alone): files with a live
     /// preview. Enter opens a shader's full preview or a picture / video full size; r renders a still, v records a video, e edits,
@@ -432,6 +438,7 @@ fn run() -> Result<ExitCode> {
             origin,
             format,
             loop_seamless,
+            threads,
             out,
         } => {
             if fps == 0 || !(0.1..=600.0).contains(&duration) {
@@ -481,6 +488,7 @@ fn run() -> Result<ExitCode> {
                     out,
                     loop_seamless,
                     ffmpeg,
+                    threads,
                 },
             )?;
             for n in &report.notes {
@@ -627,6 +635,7 @@ fn run() -> Result<ExitCode> {
             golden,
             baseline,
             origin,
+            verbose,
         } => {
             let paths = if paths.is_empty() {
                 ["examples/shaders", "presets/shaders"]
@@ -671,6 +680,15 @@ fn run() -> Result<ExitCode> {
             let started = std::time::Instant::now();
             let rows = shaderlab::regress::run(&gpu, &shaders, &opts);
             let (text, failed) = shaderlab::regress::render(&rows);
+            if verbose {
+                for r in &rows {
+                    println!(
+                        "{:?} {} [{}] {}: {}",
+                        r.status, r.shader, r.variant, r.check, r.detail
+                    );
+                }
+                println!();
+            }
             print!("{text}");
             println!(
                 "({:.1} s on {})",

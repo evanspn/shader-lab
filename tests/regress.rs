@@ -83,6 +83,7 @@ impl Fixture {
     fn opts(&self) -> Options {
         let mut o = Options::for_repo(self.dir.path());
         o.machine = Some("test-machine".into());
+        o.start_secs = Some(12.0);
         o
     }
     fn write(&self, src: &str) {
@@ -222,7 +223,7 @@ fn a_slowed_shader_fails_the_perf_baseline_but_only_on_the_machine_it_was_record
     }
     let fx = Fixture::new();
     fx.accept(&good());
-    fx.write(&shader(SKY, false, false, 4000, false, false, false));
+    fx.write(&shader(SKY, false, false, 300, false, false, false));
     let mut o = fx.opts();
     o.only = vec!["perf".into()];
     let rows = fx.run(&o);
@@ -335,4 +336,78 @@ fn the_cli_exits_non_zero_on_a_failure_and_zero_when_all_is_well() {
     let bad = run(&["regress", "demo.glsl", "--only", "golden"]);
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stdout).contains("FAIL demo [default] golden"));
+}
+
+/// A FAINT effect (a few levels over the terminal), the kind a fixed tolerance cannot see changing: a shimmer of `loops` sine
+/// terms scaled by `gain`, with a clock jump of 3.7 s after `jump_at` seconds of shader time.
+fn faint(gain: f32, loops: u32, jump_at: f32) -> String {
+    format!(
+        r#"// @float amount 0.5 0 1 "Amount"
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {{
+    vec2 uv = fragCoord / iResolution.xy;
+    vec4 term = texture(iChannel0, uv);
+    if (gp_textMask(fragCoord, term) > 0.5) {{ fragColor = term; return; }}
+    float t = iTime + (iTime > {jump_at:.1} ? 3.7 : 0.0);
+    vec3 add = vec3(0.0);
+    for (int i = 0; i < {loops}; i++) {{
+        add += vec3(0.004, 0.005, 0.006) * sin(uv.x * 6.0 * float(i + 1) + uv.y * 3.0 + t * 0.5 + float(i));
+    }}
+    fragColor = vec4(term.rgb + abs(add) * {gain:.3}, 1.0);
+}}
+"#
+    )
+}
+
+#[test]
+fn a_ten_percent_change_to_a_faint_effect_fails_the_golden_but_one_percent_does_not() {
+    if skip_without_gpu() {
+        return;
+    }
+    let fx = Fixture::new();
+    fx.accept(&faint(1.0, 8, 1e9));
+    let mut o = fx.opts();
+    o.only = vec!["golden".into()];
+    fx.write(&faint(1.01, 8, 1e9));
+    let rows = fx.run(&o);
+    assert!(
+        !failed(&rows, "golden"),
+        "+1% is within tolerance: {rows:?}"
+    );
+    fx.write(&faint(1.10, 8, 1e9));
+    let rows = fx.run(&o);
+    assert!(failed(&rows, "golden"), "+10% must fail: {rows:?}");
+}
+
+#[test]
+fn a_twentyfold_slowdown_of_a_light_shader_fails_the_perf_baseline() {
+    if skip_without_gpu() {
+        return;
+    }
+    let fx = Fixture::new();
+    fx.accept(&faint(1.0, 8, 1e9));
+    let mut o = fx.opts();
+    o.only = vec!["perf".into()];
+    fx.write(&faint(1.0, 160, 1e9));
+    let rows = fx.run(&o);
+    assert!(failed(&rows, "perf"), "20x slower must fail: {rows:?}");
+}
+
+#[test]
+fn a_clock_jump_in_a_faint_shader_at_half_an_hour_fails_the_seam_probe() {
+    if skip_without_gpu() {
+        return;
+    }
+    let fx = Fixture::new();
+    fx.accept(&faint(1.0, 8, 1e9));
+    let mut o = fx.opts();
+    o.only = vec!["temporal".into()];
+    fx.write(&faint(1.0, 8, 1800.0));
+    let rows = fx.run(&o);
+    assert!(
+        rows.iter()
+            .any(|r| r.status == Status::Fail && r.check == "seam" && r.detail.contains("t=1800")),
+        "{rows:?}"
+    );
+    fx.write(&faint(1.0, 8, 1e9));
+    assert!(!fx.run(&o).iter().any(|r| r.status == Status::Fail));
 }

@@ -605,6 +605,35 @@ impl Prepared {
         (self.width, self.height)
     }
 
+    /// Milliseconds per frame for each of `batches` batches, after `warmup` discarded ones: every batch submits `per_batch` frames
+    /// back to back and waits once, so the fixed cost of waiting (about a millisecond) is spread thin and a light shader's real cost
+    /// shows. `t0` is the `iTime` of the first frame (to measure, say, the middle of a cross-fade).
+    pub fn frame_times_batched(
+        &self,
+        gpu: &Gpu,
+        batches: u32,
+        per_batch: u32,
+        warmup: u32,
+        t0: f32,
+    ) -> Result<Vec<f64>, String> {
+        let mut v = Vec::with_capacity(batches as usize);
+        for b in 0..warmup + batches {
+            let start = Instant::now();
+            for i in 0..per_batch {
+                let t = t0 + (b * per_batch + i) as f32 * 0.0167;
+                self.set_time(gpu, t, 0.0167, i as i32);
+                gpu.queue.submit(Some(self.encode(gpu, false)));
+            }
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| format!("GPU poll failed: {e}"))?;
+            if b >= warmup {
+                v.push(start.elapsed().as_secs_f64() * 1000.0 / per_batch as f64);
+            }
+        }
+        Ok(v)
+    }
+
     /// The time of each of `n` frames, in ms (each submitted and waited for; no readback), after a short warm-up.
     pub fn frame_times(&self, gpu: &Gpu, n: u32) -> Result<Vec<f64>, String> {
         let _ = self.draw(gpu, 0.0)?;

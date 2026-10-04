@@ -56,6 +56,8 @@ pub struct Options {
     pub origin: Origin,
     /// override of the machine id (tests)
     pub machine: Option<String>,
+    /// the length of the first temporal window in seconds (default: 8 fast, 125 for the defaults of a full run, 40 for scene locks)
+    pub start_secs: Option<f32>,
 }
 
 impl Options {
@@ -68,6 +70,7 @@ impl Options {
             fast: false,
             origin: Origin::TopLeft,
             machine: None,
+            start_secs: None,
         }
     }
 
@@ -82,22 +85,39 @@ impl Options {
 const GOLDEN_MEAN: f32 = 0.8;
 /// The largest mean difference in any 16x16 block.
 const GOLDEN_BLOCK: f32 = 6.0;
+/// ... but never looser than this fraction of what the shader adds to the terminal frame (its own effect), nor tighter than the floors.
+const GOLDEN_REL_MEAN: f32 = 0.05;
+const GOLDEN_REL_BLOCK: f32 = 0.10;
+const GOLDEN_MIN_MEAN: f32 = 0.1;
+const GOLDEN_MIN_BLOCK: f32 = 0.5;
 /// The most a text pixel may change.
 const TEXT_EPS: i32 = 2;
 const COVERAGE_DELTA: f32 = 0.08;
 const FLAT_DELTA: f32 = 0.02;
 /// A frame whose change from the previous one exceeds `SPIKE_K` x the median change + `SPIKE_FLOOR` levels is a pop.
-const SPIKE_K: f32 = 4.0;
-const SPIKE_FLOOR: f32 = 2.0;
+const SPIKE_K: f32 = 8.0;
+const SPIKE_FLOOR: f32 = 0.15;
+/// ... plus this fraction of what the shader adds to the frame (its effect energy), so strong shaders keep their old allowance.
+const SPIKE_REL: f32 = 0.10;
+/// the time-wrap probes are short and quiet: a jump there must beat only this many times the window's usual change
+const SEAM_K: f32 = 3.0;
+/// in a long run a pop must also touch at least this fraction of the picture (a single falling streak does not)
+const POP_MIN_AREA: f32 = 0.15;
+const SEAM_REL: f32 = 0.02;
+const LUMA_REL: f32 = 0.08;
+const LUMA_MIN: f32 = 0.8;
+/// a brightness step must beat this many times the usual flutter of the average brightness
+const LURCH_K: f32 = 10.0;
 /// The most the average brightness may change between two frames (0..255) before it is a lurch.
-const LUMA_STEP: f32 = 2.5;
-const PERF_P50_RATIO: f64 = 1.20;
-const PERF_P95_RATIO: f64 = 1.5;
-const PERF_P50_FLOOR_MS: f64 = 0.30;
-const PERF_P95_FLOOR_MS: f64 = 1.0;
+const PERF_P50_RATIO: f64 = 1.25;
+const PERF_P95_RATIO: f64 = 1.6;
+const PERF_P50_FLOOR_MS: f64 = 0.04;
+const PERF_P95_FLOOR_MS: f64 = 0.15;
 
 const GOLDEN_SIZE: (u32, u32) = (192, 108);
 const GOLDEN_TIME: f32 = 7.0;
+/// further moments the text is checked at
+const TEXT_TIMES: [f32; 6] = [0.5, 2.0, 13.0, 29.0, 41.0, 67.0];
 /// (label, width, height) for the orientation goldens: all 60 px tall.
 const ASPECTS: [(&str, u32, u32); 5] = [
     ("16x9", 106, 60),
@@ -318,7 +338,8 @@ fn write_meta(path: &Path, m: Meta) -> std::io::Result<()> {
 #[derive(Clone, Debug, Default)]
 pub struct Baseline {
     pub machine: String,
-    pub entries: BTreeMap<String, (f64, f64)>,
+    /// key -> (p50 ms, p95 ms, the reference shader's p50 measured in the same run)
+    pub entries: BTreeMap<String, (f64, f64, f64)>,
 }
 
 impl Baseline {
@@ -328,9 +349,9 @@ impl Baseline {
             self.machine.replace('"', "'")
         );
         let n = self.entries.len();
-        for (i, (k, (p50, p95))) in self.entries.iter().enumerate() {
+        for (i, (k, (p50, p95, rf))) in self.entries.iter().enumerate() {
             s.push_str(&format!(
-                "    \"{k}\": {{\"p50_ms\": {p50:.3}, \"p95_ms\": {p95:.3}}}{}\n",
+                "    \"{k}\": {{\"p50_ms\": {p50:.3}, \"p95_ms\": {p95:.3}, \"ref_ms\": {rf:.3}}}{}\n",
                 if i + 1 < n { "," } else { "" }
             ));
         }
@@ -356,7 +377,10 @@ impl Baseline {
                     let end = rest.find([',', '}'])?;
                     rest[..end].trim().parse().ok()
                 };
-                b.entries.insert(key, (num("p50_ms")?, num("p95_ms")?));
+                b.entries.insert(
+                    key,
+                    (num("p50_ms")?, num("p95_ms")?, num("ref_ms").unwrap_or(0.0)),
+                );
             }
         }
         if b.machine.is_empty() { None } else { Some(b) }
@@ -378,25 +402,61 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * q).round() as usize]
 }
 
-/// p50 and p95 of the per-frame time at 1080p, over `n` frames. Three batches, each batch's numbers taken, and the best of them kept:
-/// a transient load on the machine (a build, a screen recording) makes a batch slower, never faster, so the best is the shader.
+/// A fixed shader measured alongside every shader, in the same process: when the machine is busy the reference slows down too, so
+/// a shader's time RELATIVE to it still tells whether the shader itself got slower.
+const REFERENCE: &str = "void mainImage(out vec4 c, in vec2 f) { vec2 p = f / iResolution.xy; vec3 a = vec3(0.0); for (int i = 0; i < 24; i++) { a += 0.02 * sin(p.xyx * float(i) + iTime + a); } c = vec4(a * 0.5 + 0.5, 1.0); }";
+
+#[derive(Clone, Copy, Debug)]
+pub struct Perf {
+    pub p50: f64,
+    pub p95: f64,
+    /// the reference shader's p50, measured in the same call
+    pub reference: f64,
+}
+
+const PERF_BATCHES: u32 = 21;
+const PERF_PER_BATCH: u32 = 8;
+
+fn batch_stats(t: &mut [f64]) -> (f64, f64) {
+    t.sort_by(|a, b| a.partial_cmp(b).expect("no NaN times"));
+    (percentile(t, 0.5), percentile(t, 0.95))
+}
+
+/// p50 and p95 of the GPU time per frame at `size`, in batches of back-to-back frames (the cost of waiting is spread over each batch),
+/// from `t0` seconds of shader time, with the reference shader's p50 beside it.
 pub fn perf_of(
     gpu: &Gpu,
     src: &str,
     var: &Variant,
     origin: Origin,
-    n: u32,
-) -> Result<(f64, f64), String> {
-    let frame = Frame::sample(1920, 1080);
+    size: (u32, u32),
+    t0: f32,
+) -> Result<Perf, String> {
+    let frame = Frame::sample(size.0, size.1);
     let p = prepare(gpu, src, var, &frame, origin)?;
-    let (mut best50, mut best95) = (f64::MAX, f64::MAX);
-    for _ in 0..3 {
-        let mut t = p.frame_times(gpu, n)?;
-        t.sort_by(|a, b| a.partial_cmp(b).expect("no NaN times"));
-        best50 = best50.min(percentile(&t, 0.5));
-        best95 = best95.min(percentile(&t, 0.95));
-    }
-    Ok((best50, best95))
+    let mut t = p.frame_times_batched(gpu, PERF_BATCHES, PERF_PER_BATCH, 3, t0)?;
+    let (p50, p95) = batch_stats(&mut t);
+    let r = gpu::prepare_shader(gpu, REFERENCE, None, &[], &frame, origin)?;
+    let mut rt = r.frame_times_batched(gpu, PERF_BATCHES, PERF_PER_BATCH, 3, 0.0)?;
+    let (reference, _) = batch_stats(&mut rt);
+    Ok(Perf {
+        p50,
+        p95,
+        reference,
+    })
+}
+
+/// Is `p` within tolerance of the baseline entry `(b50, b95, bref)`? Slower by more than 25% (plus a small floor that grows with the
+/// shader's own time) in absolute terms AND relative to the reference shader is a regression; slower in absolute terms only is a
+/// busy machine.
+pub fn perf_within(p: &Perf, b: (f64, f64, f64)) -> bool {
+    let (b50, b95, bref) = b;
+    let abs50 = p.p50 <= b50 * PERF_P50_RATIO + PERF_P50_FLOOR_MS + 0.05 * b50;
+    let abs95 = p.p95 <= b95 * PERF_P95_RATIO + PERF_P95_FLOOR_MS + 0.05 * b95;
+    let rel50 = bref > 0.0
+        && p.reference > 0.0
+        && p.p50 / p.reference <= (b50 / bref) * PERF_P50_RATIO + 0.02;
+    (abs50 && abs95) || rel50
 }
 
 // ---- the checks ---------------------------------------------------------------------------------------
@@ -412,12 +472,14 @@ fn row(shader: &str, variant: &str, check: &str, status: Status, detail: impl In
 }
 
 /// Compare `rgba` (w x h) with the golden at `path`; with `update`, write it.
+#[allow(clippy::too_many_arguments)]
 fn golden_row(
     shader: &str,
     variant: &str,
     check: &str,
     path: &Path,
     rgba: &[u8],
+    input: &[u8],
     (w, h): (u32, u32),
     update: bool,
 ) -> Row {
@@ -469,13 +531,20 @@ fn golden_row(
                 );
             }
             let (mean, block) = image_diff(&gold, rgba, w, h);
-            if mean <= GOLDEN_MEAN && block <= GOLDEN_BLOCK {
+            // the tolerance is relative to what the shader itself adds to the picture: a faint effect (a few levels over the
+            // terminal) must not hide a +10% change behind a fixed allowance meant for strong ones
+            let (effect_mean, effect_block) = image_diff(&gold, input, w, h);
+            let tol_mean = (GOLDEN_REL_MEAN * effect_mean).clamp(GOLDEN_MIN_MEAN, GOLDEN_MEAN);
+            let tol_block = (GOLDEN_REL_BLOCK * effect_block).clamp(GOLDEN_MIN_BLOCK, GOLDEN_BLOCK);
+            if mean <= tol_mean && block <= tol_block {
                 row(
                     shader,
                     variant,
                     check,
                     Status::Pass,
-                    format!("mean {mean:.2}, worst block {block:.1}"),
+                    format!(
+                        "mean {mean:.2} (max {tol_mean:.2}), worst block {block:.1} (max {tol_block:.1})"
+                    ),
                 )
             } else {
                 row(
@@ -484,13 +553,41 @@ fn golden_row(
                     check,
                     Status::Fail,
                     format!(
-                        "differs from the golden: mean {mean:.2} (max {GOLDEN_MEAN}), worst block {block:.1} (max {GOLDEN_BLOCK})"
+                        "differs from the golden: mean {mean:.2} (max {tol_mean:.2} = {:.0}% of its effect {effect_mean:.2}), worst block {block:.1} (max {tol_block:.1})",
+                        GOLDEN_REL_MEAN * 100.0
                     ),
                 )
             }
         }
     }
 }
+
+/// The gap between neighbouring 32-bit floats near `t`, in seconds.
+pub fn f32_spacing(t: f32) -> f32 {
+    2.0f32.powi(t.max(1.0).log2().floor() as i32 - 23)
+}
+
+/// Moments a long-running shader might wrap its clock or position (modulo restarts at 100 and 1800 s, hours, days, float limits).
+pub const WRAP_PROBES: [f32; 18] = [
+    100.0,
+    200.0,
+    300.0,
+    600.0,
+    900.0,
+    1800.0,
+    2400.0,
+    3600.0,
+    7200.0,
+    14400.0,
+    21600.0,
+    43200.0,
+    65536.0,
+    86400.0,
+    100_000.0,
+    131_072.0,
+    604_800.0,
+    1_000_000.0,
+];
 
 /// The animation checks over `secs` of shader time at 24 fps, 160x90: pops, brightness lurches, and (full run) the time-wrap seams.
 pub fn temporal_rows(
@@ -511,16 +608,33 @@ pub fn temporal_rows(
     let mut windows: Vec<(String, f32, f32)> = vec![("start".into(), 5.0, secs)];
     if seams {
         // the usual moments a long-running shader wraps its clock or its position
-        for t in [2400.0f32, 3600.0, 86400.0] {
+        for t in WRAP_PROBES {
             windows.push((format!("t={t}"), t - 2.0, 4.0));
         }
     }
     let mut out = Vec::new();
     let mut reference_median = 0.0f32;
+    let mut reference_step = 0.0f32;
+    let mut reference_area = 0.0f32;
+    // what the shader adds to the terminal frame: the pop floor and the brightness step are relative to it, so a faint effect's
+    // clock jump or flash is not hidden below a fixed allowance
+    let mut effect = 0.0f32;
     for (label, start, len) in windows {
+        // 32-bit iTime cannot tell one 24 fps frame from the next once its spacing exceeds half a frame: that is the clock, not the shader
+        if label != "start" && f32_spacing(start) * 2.0 > 1.0 / 24.0 {
+            out.push(row(
+                name,
+                &var.label,
+                "seam",
+                Status::Skip,
+                format!("{label}: a 32-bit iTime has steps of {:.3} s here, coarser than a frame: not probed", f32_spacing(start)),
+            ));
+            continue;
+        }
         let n = (len * 24.0) as usize;
         let mut prev: Option<Vec<u8>> = None;
-        let (mut diffs, mut means) = (Vec::new(), Vec::new());
+        let (mut diffs, mut means, mut areas) = (Vec::new(), Vec::new(), Vec::new());
+        let mut effects: Vec<f32> = Vec::new();
         let mut buf = Vec::new();
         for i in 0..n {
             let t = start + i as f32 / 24.0;
@@ -538,6 +652,15 @@ pub fn temporal_rows(
             }
             let mean = buf.chunks(4).map(luminance).sum::<f32>() / (w * h) as f32 * 255.0;
             means.push(mean);
+            if label == "start" {
+                effects.push(
+                    buf.iter()
+                        .zip(&frame.rgba)
+                        .map(|(a, b)| (*a as f32 - *b as f32).abs())
+                        .sum::<f32>()
+                        / buf.len() as f32,
+                );
+            }
             if let Some(pv) = &prev {
                 let d = pv
                     .iter()
@@ -546,6 +669,14 @@ pub fn temporal_rows(
                     .sum::<f32>()
                     / buf.len() as f32;
                 diffs.push(d);
+                // how much of the picture moved: a rain drop changes a few pixels a lot, a camera jump changes most of them
+                areas.push(
+                    pv.iter()
+                        .zip(&buf)
+                        .filter(|(a, b)| (**a as i32 - **b as i32).abs() >= 2)
+                        .count() as f32
+                        / buf.len() as f32,
+                );
             }
             prev = Some(buf.clone());
         }
@@ -554,43 +685,73 @@ pub fn temporal_rows(
         let median = sorted[sorted.len() / 2];
         // a pop is a frame far from ITS OWN neighbourhood (a playlist moves faster in some scenes than in others), so each change is
         // judged against the median of the changes within a second either side of it
-        let local_median = |i: usize| {
-            let (lo, hi) = (i.saturating_sub(24), (i + 25).min(diffs.len()));
-            let mut w: Vec<f32> = diffs[lo..hi].to_vec();
+        let local_median = |v: &[f32], i: usize| {
+            let (lo, hi) = (i.saturating_sub(24), (i + 25).min(v.len()));
+            let mut w: Vec<f32> = v[lo..hi].to_vec();
             w.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
             w[w.len() / 2]
         };
+        let mut sorted_areas = areas.clone();
+        sorted_areas.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        let median_area = sorted_areas[sorted_areas.len() / 2];
+        if label == "start" {
+            effects.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+            effect = effects[effects.len() / 2];
+        }
+        let floor = (SPIKE_REL * effect).max(SPIKE_FLOOR);
+        let luma_step = (LUMA_REL * effect).clamp(LUMA_MIN, 4.0);
         let mut worst = 0.0f32;
         let mut pop = false;
         for (i, d) in diffs.iter().enumerate() {
             worst = worst.max(*d);
-            if *d > SPIKE_K * local_median(i) + SPIKE_FLOOR {
+            // a pop is big in size AND wide in extent (sparse sparkle or rain is not a pop)
+            if *d > SPIKE_K * local_median(&diffs, i).max(0.5 * median) + floor
+                && *d > 0.25 * effect
+                && areas[i]
+                    > (2.0 * local_median(&areas, i).max(0.5 * median_area) + 0.03)
+                        .max(POP_MIN_AREA)
+            {
                 pop = true;
             }
         }
-        let mut lurch = 0.0f32;
-        for w2 in means.windows(2) {
-            lurch = lurch.max((w2[1] - w2[0]).abs());
+        // a lurch is a step in the average brightness far beyond the usual flutter (rain, sparkles): judged against the median step
+        let steps: Vec<f32> = means.windows(2).map(|w2| (w2[1] - w2[0]).abs()).collect();
+        let mut sorted_steps = steps.clone();
+        sorted_steps.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        let median_step = sorted_steps[sorted_steps.len() / 2];
+        let lurch = steps.iter().cloned().fold(0.0f32, f32::max);
+        let lurch_at =
+            start + (steps.iter().position(|v| *v == lurch).unwrap_or(0) + 1) as f32 / 24.0;
+        if label == "start" {
+            reference_step = median_step;
         }
+        let lurch_limit = LURCH_K * median_step.max(reference_step) + luma_step;
         if label == "start" {
             reference_median = median;
+            reference_area = median_area;
         }
         // around a wrap the reference is the ordinary motion of the start of the run
         if label != "start" {
-            pop = worst > SPIKE_K * reference_median.max(median) + SPIKE_FLOOR;
+            let widest = areas.iter().cloned().fold(0.0f32, f32::max);
+            // (short windows where nothing should happen: tighter than the long run, judged against the window's own motion)
+            pop = worst
+                > SEAM_K * median.max(0.5 * reference_median)
+                    + (SEAM_REL * effect).max(SPIKE_FLOOR)
+                && widest > 2.0 * reference_area.max(median_area) + 0.03;
         }
-        let status = if pop || lurch > LUMA_STEP {
+        let lurched = lurch > lurch_limit;
+        let status = if pop || lurched {
             Status::Fail
         } else {
             Status::Pass
         };
         let mut detail = format!(
-            "{label}: median change {median:.2}, worst {worst:.2}, largest brightness step {lurch:.2}"
+            "{label}: median change {median:.2}, worst {worst:.2}, largest brightness step {lurch:.2} (at t={lurch_at:.1} s)"
         );
         if pop {
             detail.push_str(" - a frame pops");
         }
-        if lurch > LUMA_STEP {
+        if lurched {
             detail.push_str(" - the brightness lurches");
         }
         out.push(row(
@@ -631,6 +792,7 @@ pub fn run_shader(
                             "golden",
                             &path,
                             &out,
+                            &frame.rgba,
                             GOLDEN_SIZE,
                             opts.update,
                         ));
@@ -644,16 +806,26 @@ pub fn run_shader(
                             "marked `// regress: text-ok`: it draws over text by design",
                         ));
                     } else if opts.wants("text") {
-                        let bad = (0..frame.text.len())
-                            .filter(|&i| {
-                                frame.text[i]
-                                    && (0..3).any(|c| {
-                                        (frame.rgba[i * 4 + c] as i32 - out[i * 4 + c] as i32).abs()
-                                            > TEXT_EPS
-                                    })
-                            })
-                            .count();
-                        // a pixel next to text may be softened by an effect that keeps clear of it; only the text itself is held
+                        // at several moments: a guard that fails only when a drop or a ribbon happens to cross the text still shows
+                        let changed = |f: &Frame, o: &[u8]| {
+                            (0..f.text.len())
+                                .filter(|&i| {
+                                    f.text[i]
+                                        && (0..3).any(|c| {
+                                            (f.rgba[i * 4 + c] as i32 - o[i * 4 + c] as i32).abs()
+                                                > TEXT_EPS
+                                        })
+                                })
+                                .count()
+                        };
+                        let mut bad = changed(&frame, &out);
+                        for t in TEXT_TIMES {
+                            if let Ok((f2, o2)) =
+                                render_at(gpu, src, &var, GOLDEN_SIZE, t, opts.origin)
+                            {
+                                bad += changed(&f2, &o2);
+                            }
+                        }
                         let _ = dilate;
                         rows.push(if bad == 0 {
                             row(
@@ -661,7 +833,11 @@ pub fn run_shader(
                                 &var.label,
                                 "text",
                                 Status::Pass,
-                                format!("{} text pixels unchanged", frame.text_pixels()),
+                                format!(
+                                    "{} text pixels unchanged at {} moments",
+                                    frame.text_pixels(),
+                                    TEXT_TIMES.len() + 1
+                                ),
                             )
                         } else {
                             row(
@@ -729,7 +905,7 @@ pub fn run_shader(
                 let check = format!("orient {label}");
                 match render_at(gpu, src, &var, (w, h), GOLDEN_TIME, opts.origin) {
                     Err(e) => rows.push(row(stem, &var.label, &check, Status::Fail, e)),
-                    Ok((_, out)) => {
+                    Ok((aframe, out)) => {
                         let path = gdir.join(format!("{}@{label}.png", var.label));
                         rows.push(golden_row(
                             stem,
@@ -737,6 +913,7 @@ pub fn run_shader(
                             &check,
                             &path,
                             &out,
+                            &aframe.rgba,
                             (w, h),
                             opts.update,
                         ));
@@ -745,7 +922,15 @@ pub fn run_shader(
             }
         }
         if opts.wants("temporal") && (var.label == "default" || var.label.starts_with("scene-")) {
-            let secs = if opts.fast { 8.0 } else { 40.0 };
+            let secs = if let Some(s) = opts.start_secs {
+                s
+            } else if opts.fast {
+                8.0
+            } else if var.label == "default" {
+                125.0
+            } else {
+                40.0
+            };
             rows.extend(temporal_rows(
                 gpu,
                 stem,
@@ -756,64 +941,149 @@ pub fn run_shader(
                 !opts.fast,
             ));
         }
-        if opts.wants("perf")
-            && !opts.fast
-            && (var.label == "default" || var.label.starts_with("scene-"))
-        {
-            let key = format!("{stem}|{}|1920x1080", var.label);
-            match perf_of(gpu, src, &var, opts.origin, 40) {
-                Err(e) => rows.push(row(stem, &var.label, "perf", Status::Fail, e)),
-                Ok((p50, p95)) => {
-                    if opts.update {
-                        baseline.entries.insert(key, (p50, p95));
-                        rows.push(row(
-                            stem,
-                            &var.label,
-                            "perf",
-                            Status::Updated,
-                            format!("p50 {p50:.2} ms, p95 {p95:.2} ms"),
-                        ));
-                    } else if !baseline_machine_ok {
-                        rows.push(row(
-                            stem,
-                            &var.label,
-                            "perf",
-                            Status::Skip,
-                            format!("baseline is for {:?}, this machine is {machine:?}: not compared (p50 {p50:.2} ms)", baseline.machine),
-                        ));
-                    } else if let Some(&(b50, b95)) = baseline.entries.get(&key) {
-                        // a slow reading on a shared machine gets one more try before it counts
-                        let (mut p50, mut p95) = (p50, p95);
-                        if (p50 > b50 * PERF_P50_RATIO + PERF_P50_FLOOR_MS
-                            || p95 > b95 * PERF_P95_RATIO + PERF_P95_FLOOR_MS)
-                            && let Ok((q50, q95)) = perf_of(gpu, src, &var, opts.origin, 40)
-                        {
-                            p50 = p50.min(q50);
-                            p95 = p95.min(q95);
-                        }
-                        let ok50 = p50 <= b50 * PERF_P50_RATIO + PERF_P50_FLOOR_MS;
-                        let ok95 = p95 <= b95 * PERF_P95_RATIO + PERF_P95_FLOOR_MS;
-                        rows.push(row(
-                            stem,
-                            &var.label,
-                            "perf",
-                            if ok50 && ok95 { Status::Pass } else { Status::Fail },
-                            format!("p50 {p50:.2} ms (baseline {b50:.2}), p95 {p95:.2} ms (baseline {b95:.2}){}", if ok50 && ok95 { "" } else { " - slower than the baseline" }),
-                        ));
-                    } else {
-                        rows.push(row(
-                            stem,
-                            &var.label,
-                            "perf",
-                            Status::Fail,
-                            "no baseline entry (run with --update)",
-                        ));
+        if opts.wants("perf") && !opts.fast {
+            let mut jobs: Vec<(String, (u32, u32), f32)> = Vec::new();
+            if var.label == "default" || var.label.starts_with("scene-") {
+                jobs.push((var.label.clone(), (1920, 1080), 0.0));
+            }
+            if var.label == "default" {
+                jobs.push((var.label.clone(), (2560, 1440), 0.0));
+                // a playlist's cross-fade renders two scenes at once: time the middle of one
+                if let Ok(schema) = params::parse_schema(params::strip_header(src)) {
+                    let num = |name: &str| {
+                        schema
+                            .params
+                            .iter()
+                            .find(|p| p.name == name)
+                            .and_then(|p| p.default.parse::<f32>().ok())
+                    };
+                    if let (Some(period), Some(fade)) = (num("scene_period"), num("fade")) {
+                        jobs.push(("crossfade".into(), (1920, 1080), period - fade / 2.0));
                     }
                 }
+            }
+            for (label, size, t0) in jobs {
+                let v = if label == "crossfade" {
+                    Variant {
+                        label: "default".into(),
+                        preset: None,
+                        sets: vec![],
+                    }
+                } else {
+                    var.clone()
+                };
+                let key = format!("{stem}|{label}|{}x{}", size.0, size.1);
+                rows.push(perf_row(
+                    gpu,
+                    stem,
+                    src,
+                    &v,
+                    &label,
+                    &key,
+                    size,
+                    t0,
+                    opts,
+                    baseline,
+                    machine,
+                    baseline_machine_ok,
+                ));
             }
         }
     }
     rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perf_row(
+    gpu: &Gpu,
+    stem: &str,
+    src: &str,
+    var: &Variant,
+    label: &str,
+    key: &str,
+    size: (u32, u32),
+    t0: f32,
+    opts: &Options,
+    baseline: &mut Baseline,
+    machine: &str,
+    baseline_machine_ok: bool,
+) -> Row {
+    let first = match perf_of(gpu, src, var, opts.origin, size, t0) {
+        Ok(p) => p,
+        Err(e) => return row(stem, label, "perf", Status::Fail, e),
+    };
+    if opts.update {
+        baseline
+            .entries
+            .insert(key.to_string(), (first.p50, first.p95, first.reference));
+        return row(
+            stem,
+            label,
+            "perf",
+            Status::Updated,
+            format!(
+                "{}x{}: p50 {:.3} ms, p95 {:.3} ms (reference {:.3} ms)",
+                size.0, size.1, first.p50, first.p95, first.reference
+            ),
+        );
+    }
+    if !baseline_machine_ok {
+        return row(
+            stem,
+            label,
+            "perf",
+            Status::Skip,
+            format!(
+                "baseline is for {:?}, this machine is {machine:?}: not compared (p50 {:.3} ms)",
+                baseline.machine, first.p50
+            ),
+        );
+    }
+    let Some(&b) = baseline.entries.get(key) else {
+        return row(
+            stem,
+            label,
+            "perf",
+            Status::Fail,
+            "no baseline entry (run with --update)",
+        );
+    };
+    // a reading over the line is measured twice more, interleaved with the rest of the run, before it counts
+    let mut best = first;
+    let mut ok = perf_within(&first, b);
+    for _ in 0..2 {
+        if ok {
+            break;
+        }
+        if let Ok(q) = perf_of(gpu, src, var, opts.origin, size, t0) {
+            ok = perf_within(&q, b);
+            if q.p50 < best.p50 {
+                best = q;
+            }
+        }
+    }
+    row(
+        stem,
+        label,
+        "perf",
+        if ok { Status::Pass } else { Status::Fail },
+        format!(
+            "{}x{}: p50 {:.3} ms (baseline {:.3}), p95 {:.3} ms (baseline {:.3}), x{:.2} of the reference (baseline x{:.2}){}",
+            size.0,
+            size.1,
+            best.p50,
+            b.0,
+            best.p95,
+            b.1,
+            best.p50 / best.reference.max(1e-9),
+            b.0 / b.2.max(1e-9),
+            if ok {
+                ""
+            } else {
+                " - slower than the baseline"
+            }
+        ),
+    )
 }
 
 /// Shaders under `paths` (a .glsl file, or a folder of them).
@@ -1008,8 +1278,10 @@ mod tests {
             machine: "Apple M3 Max / macOS 26.0".into(),
             entries: BTreeMap::new(),
         };
-        b.entries.insert("a|default|1920x1080".into(), (1.25, 1.5));
-        b.entries.insert("b|scene-3|1920x1080".into(), (3.0, 4.125));
+        b.entries
+            .insert("a|default|1920x1080".into(), (1.25, 1.5, 0.5));
+        b.entries
+            .insert("b|scene-3|1920x1080".into(), (3.0, 4.125, 0.75));
         let back = Baseline::parse(&b.to_json()).expect("parses");
         assert_eq!(back.machine, b.machine);
         assert_eq!(back.entries, b.entries);

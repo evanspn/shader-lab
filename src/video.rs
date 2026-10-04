@@ -39,6 +39,8 @@ pub struct VideoOptions {
     pub out: PathBuf,
     pub loop_seamless: bool,
     pub ffmpeg: Option<PathBuf>,
+    /// threads the mp4 encoder may use (default [`DEFAULT_THREADS`]): ffmpeg left alone takes every core of the machine
+    pub threads: u32,
 }
 
 #[derive(Debug)]
@@ -52,6 +54,9 @@ pub struct VideoReport {
     pub ms_per_frame: f64,
     pub notes: Vec<String>,
 }
+
+/// The encoder's thread cap: a long mp4 render must not pin the whole Mac.
+pub const DEFAULT_THREADS: u32 = 2;
 
 /// GIF files get large fast: cap the frame rate and width.
 pub const GIF_MAX_FPS: u32 = 20;
@@ -120,8 +125,22 @@ struct FfmpegSink {
 }
 
 impl FfmpegSink {
-    fn start(ffmpeg: &Path, size: (u32, u32), fps: u32, out: &Path) -> Result<FfmpegSink> {
-        let child = Command::new(ffmpeg)
+    fn start(
+        ffmpeg: &Path,
+        size: (u32, u32),
+        fps: u32,
+        out: &Path,
+        threads: u32,
+    ) -> Result<FfmpegSink> {
+        // niced (priority 10) so the machine stays responsive for whoever is using it, with the encoder capped to `threads`
+        let mut cmd = if cfg!(unix) && Path::new("/usr/bin/nice").exists() {
+            let mut c = Command::new("/usr/bin/nice");
+            c.args(["-n", "10"]).arg(ffmpeg);
+            c
+        } else {
+            Command::new(ffmpeg)
+        };
+        let child = cmd
             .args([
                 "-y",
                 "-loglevel",
@@ -140,14 +159,21 @@ impl FfmpegSink {
                 "-",
             ])
             // H.264 needs even dimensions: trim a stray odd pixel row/column rather than fail
-            .args(["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"])
+            .args([
+                "-filter_threads",
+                "1",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            ])
             .args([
                 "-c:v",
                 "libx264",
                 "-preset",
-                "medium",
+                "veryfast",
                 "-crf",
                 "18",
+                "-threads",
+                &threads.max(1).to_string(),
                 "-movflags",
                 "+faststart",
             ])
@@ -328,7 +354,13 @@ pub fn render_video(gpu: &Gpu, prepared: &Prepared, opts: &VideoOptions) -> Resu
                 .ffmpeg
                 .as_deref()
                 .context("ffmpeg is required for mp4")?;
-            Box::new(FfmpegSink::start(ffmpeg, size, fps, &opts.out)?)
+            Box::new(FfmpegSink::start(
+                ffmpeg,
+                size,
+                fps,
+                &opts.out,
+                opts.threads,
+            )?)
         }
         Format::Gif => Box::new(GifSink::start(size, dst, fps, &opts.out)?),
         Format::Frames => {
